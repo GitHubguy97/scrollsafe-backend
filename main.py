@@ -28,45 +28,7 @@ DOOM_SCROLLER_CACHE = {
         "confidence": 0.87, 
         "source": "DS Cache",
         "reason": "Deepfake detection model flagged this video"
-    },
-    "ABC123XYZ": { 
-        "result": "ai-detected", 
-        "confidence": 0.92, 
-        "source": "DS Cache",
-        "reason": "AI-generated faces detected with high confidence"
-    },
-    "DEF456GHI": { 
-        "result": "ai-detected", 
-        "confidence": 0.78, 
-        "source": "DS Cache",
-        "reason": "Synthetic audio patterns identified"
-    },
-    # Verified real videos
-    "JKL789MNO": { 
-        "result": "verified", 
-        "confidence": 0.95, 
-        "source": "DS Cache",
-        "reason": "C2PA credentials from trusted source (Reuters)"
-    },
-    "PQR012STU": { 
-        "result": "verified", 
-        "confidence": 0.88, 
-        "source": "DS Cache",
-        "reason": "Verified by multiple fact-checking sources"
-    },
-    # Suspicious videos
-    "VWX345YZA": { 
-        "result": "suspicious", 
-        "confidence": 0.65, 
-        "source": "DS Cache",
-        "reason": "Multiple AI indicators detected"
-    },
-    "BCD678EFG": { 
-        "result": "suspicious", 
-        "confidence": 0.72, 
-        "source": "DS Cache",
-        "reason": "Encoder signature suggests AI processing"
-    }
+    },   
 }
 
 app.add_middleware(

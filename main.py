@@ -5,11 +5,15 @@ from typing import Optional
 import time
 import json
 from datetime import datetime
+from dotenv import load_dotenv
 from video_utils import get_video_info
 from heuristics import check_heuristics
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from huggingface_client import analyze_with_huggingface
+
+# Load environment variables
+load_dotenv()
 
 app = FastAPI(title="ScrollSafe Backend", version="1.0.0")
 

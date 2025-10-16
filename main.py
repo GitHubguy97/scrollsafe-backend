@@ -127,7 +127,7 @@ async def analyze_video(video_id: str, request: Request):
 async def deep_scan_video(video_id: str, request: Request):
     request_start = time.time()
     
-    print(f"🤖 Starting deep scan for: {video_id}")
+    print(f"Starting deep scan for: {video_id}")
     
     if await request.is_disconnected():
         return
@@ -136,12 +136,12 @@ async def deep_scan_video(video_id: str, request: Request):
     result = await analyze_with_huggingface(video_id)
     
     total_duration = time.time() - request_start
-    print(f"✅ Deep scan complete: {total_duration:.3f}s - Result: {result['result']}")
+    print(f"Deep scan complete: {total_duration:.3f}s - Result: {result['result']}")
     
     return AnalysisResult(
         result=result["result"],
         confidence=result["confidence"],
         reason=result["reason"],
-        source="Hugging Face ML Model"
+        source="Hybrid AI + Heuristics"
     )
 

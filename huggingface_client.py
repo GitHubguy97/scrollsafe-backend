@@ -1,46 +1,63 @@
 import requests
 import asyncio
+import io
 from typing import Dict
 from video_utils import get_video_info
 from heuristics import check_heuristics
 import os
 from dotenv import load_dotenv
-from huggingface_hub import InferenceClient
+from PIL import Image
 
 load_dotenv()
 
-HUGGING_FACE_API_KEY = os.getenv("HUGGING_FACE_API_KEY")
+HUGGING_FACE_API_KEY = os.getenv("HUGGING_FACE_API_KEY") or os.getenv("HF_TOKEN")
 
 async def analyze_with_huggingface(video_id: str) -> Dict:
     """
-    Deep scan: AI thumbnail analysis + enhanced heuristics fallback
-    Uses Hugging Face Inference API to analyze video thumbnail
-    Falls back to heuristics if AI analysis fails
+    Deep scan: AI thumbnail analysis with heuristics fallback for false negatives
+    Uses cropped thumbnail + haywoodsloan model, falls back to heuristics when AI says "verified" but heuristics says "ai-detected"
     """
     
-    # Step 1: Try AI thumbnail analysis first
+    # Step 1: Get heuristics result for comparison
+    print(f"Getting heuristics baseline for {video_id}")
+    video_info = get_video_info(video_id)
+    heuristics_result = None
+    if video_info:
+        heuristics_result = check_heuristics(video_info)
+        print(f"Heuristics result: {heuristics_result['result']} ({heuristics_result['confidence']:.2f})")
+    
+    # Step 2: Try AI thumbnail analysis
     ai_result = None
     if HUGGING_FACE_API_KEY:
         try:
-            print(f"🤖 Attempting AI thumbnail analysis for {video_id}")
+            print(f"Attempting AI thumbnail analysis for {video_id}")
             ai_result = await analyze_thumbnail_with_ai(video_id)
             if ai_result:
-                print(f"✅ AI analysis successful: {ai_result['result']}")
+                print(f"AI analysis successful: {ai_result['result']} ({ai_result['confidence']:.2f})")
+                
+                # Decision logic: If AI says "verified" but heuristics says "ai-detected", trust heuristics
+                if (ai_result["result"] == "verified" and 
+                    heuristics_result and 
+                    heuristics_result["result"] == "ai-detected"):
+                    print(f"AI says verified but heuristics says ai-detected - trusting heuristics")
+                    return {
+                        "result": "ai-detected",
+                        "confidence": min(heuristics_result["confidence"] + 0.1, 0.95),
+                        "reason": f"Heuristics override: {heuristics_result['reason']}"
+                    }
+                
+                # Otherwise trust AI result
                 return ai_result
         except Exception as e:
-            print(f"⚠️ AI analysis failed, falling back to heuristics: {e}")
+            print(f"AI analysis failed, falling back to heuristics: {e}")
     else:
-        print(f"⚠️ No Hugging Face API key, using heuristics only")
+        print(f"No Hugging Face API key, using heuristics only")
     
-    # Step 2: Fallback to heuristics-based analysis
-    print(f"📊 Using heuristics-based analysis for {video_id}")
+    # Step 3: Fallback to heuristics-based analysis
+    print(f"Using heuristics-based analysis for {video_id}")
     await asyncio.sleep(1.0)  # Simulate processing time
     
-    video_info = get_video_info(video_id)
-    
-    if video_info:
-        heuristics_result = check_heuristics(video_info)
-        
+    if heuristics_result:
         # If heuristics found AI, boost confidence for deep scan
         if heuristics_result["result"] == "ai-detected":
             return {
@@ -56,7 +73,7 @@ async def analyze_with_huggingface(video_id: str) -> Dict:
             }
     
     # No AI indicators found
-    print(f"✅ No AI indicators found, marking as verified")
+    print(f"No AI indicators found, marking as verified")
     return {
         "result": "verified",
         "confidence": 0.75,
@@ -65,120 +82,134 @@ async def analyze_with_huggingface(video_id: str) -> Dict:
 
 async def analyze_thumbnail_with_ai(video_id: str) -> Dict:
     """
-    Analyze video thumbnail using OpenAI's CLIP model via Hugging Face Inference API
-    Uses zero-shot image classification to compare thumbnail against text descriptions
+    Analyze video thumbnail using haywoodsloan/ai-image-detector-dev-deploy with center cropping
+    Downloads thumbnail, crops to 9:16 center, sends to AI detector
     Returns analysis result or None if fails
     """
     
     try:
-        # Get YouTube thumbnail (maxresdefault for best quality)
-        thumbnail_url = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+        # Download thumbnail bytes
+        raw_bytes = _download_thumbnail_bytes(video_id)
+        if not raw_bytes:
+            raise RuntimeError("Could not download thumbnail")
         
-        print(f"🔍 Analyzing thumbnail: {thumbnail_url}")
+        # Load and crop image
+        img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        w, h = img.size
+        l, t, r, b = _compute_center_crop_box(w, h, margin=0.02)
+        cropped = img.crop((l, t, r, b))
         
-        # Initialize Hugging Face Inference Client
-        client = InferenceClient(token=HUGGING_FACE_API_KEY)
+        print(f"Cropped thumbnail: {w}x{h} -> {cropped.size} (box={[l,t,r,b]})")
         
-        # Use OpenCLIP model for zero-shot image classification
-        # Model: openai/clip-vit-large-patch14 hosted on Hugging Face
-        model_name = "openai/clip-vit-large-patch14"
+        # Convert to JPEG bytes
+        buf = io.BytesIO()
+        cropped.save(buf, format="JPEG", quality=90)
+        img_bytes = buf.getvalue()
         
-        # Define candidate labels for zero-shot classification
-        # CLIP will compute similarity scores between the image and each label
-        candidate_labels = [
-            "AI generated image",
-            "synthetic CGI render", 
-            "computer generated graphics",
-            "real photograph",
-            "authentic video frame"
-        ]
+        # Call haywoodsloan model
+        result = _classify_haywood_bytes(img_bytes)
         
-        # Perform zero-shot image classification via Inference API
-        result = client.zero_shot_image_classification(
-            thumbnail_url,
-            candidate_labels,
-            model=model_name
-        )
+        print(f"Haywood Response: {result}")
         
-        print(f"🔍 CLIP Response: {result}")
+        # Parse result - find artificial vs real scores
+        artificial_score = 0.0
+        real_score = 0.0
         
-        # Calculate AI likelihood score from CLIP's similarity scores
-        ai_score = calculate_ai_score_from_clip(result)
+        for item in result:
+            label = str(item.get("label", "")).lower()
+            score = float(item.get("score", 0.0))
+            if "artificial" in label:
+                artificial_score = score
+            elif "real" in label:
+                real_score = score
         
-        print(f"🤖 AI model analysis complete: score={ai_score:.2f}")
+        confidence = max(artificial_score, real_score)
+        is_ai = artificial_score >= real_score
         
-        # Return classification based on AI score threshold
-        if ai_score > 0.7:
+        print(f"AI analysis complete: artificial={artificial_score:.3f}, real={real_score:.3f}")
+        
+        # Return classification based on AI score
+        if is_ai and artificial_score >= 0.8:
             return {
                 "result": "ai-detected",
-                "confidence": ai_score,
-                "reason": f"CLIP model detected synthetic visual patterns (confidence: {ai_score:.0%})"
+                "confidence": artificial_score,
+                "reason": f"AI detector (cropped) classified as artificial (confidence: {artificial_score:.0%})"
             }
-        elif ai_score > 0.5:
+        elif is_ai and artificial_score >= 0.6:
             return {
-                "result": "suspicious",
-                "confidence": ai_score,
-                "reason": f"CLIP model flagged potential synthetic content (confidence: {ai_score:.0%})"
+                "result": "suspicious", 
+                "confidence": artificial_score,
+                "reason": f"AI detector (cropped) flagged potential synthetic content (confidence: {artificial_score:.0%})"
             }
         else:
             return {
                 "result": "verified",
-                "confidence": 1.0 - ai_score,
-                "reason": f"CLIP model analysis indicates authentic content"
+                "confidence": real_score,
+                "reason": f"AI detector (cropped) indicates authentic content (confidence: {real_score:.0%})"
             }
             
     except Exception as e:
         import traceback
-        print(f"❌ AI analysis exception: {type(e).__name__}: {str(e)}")
+        print(f"AI analysis exception: {type(e).__name__}: {str(e)}")
         print(f"Full traceback: {traceback.format_exc()}")
         return None
 
 
-def calculate_ai_score_from_clip(clip_response) -> float:
-    """
-    Calculate AI-generation likelihood from CLIP's zero-shot classification scores
-    
-    CLIP returns similarity scores between the image and each text prompt.
-    We aggregate scores for AI-related prompts vs. real-content prompts.
-    
-    Args:
-        clip_response: List of {"label": str, "score": float} from CLIP
-    
-    Returns:
-        Float between 0-1 representing likelihood of AI-generated content
-    """
-    
-    # Handle different possible response formats
-    if not clip_response or not isinstance(clip_response, list):
-        print(f"⚠️ Unexpected CLIP response format, using default score")
-        return 0.6  # Default moderate suspicion
-    
-    # Map labels to AI vs. Real categories
-    ai_keywords = ["ai", "generated", "synthetic", "cgi", "computer", "render", "fake"]
-    real_keywords = ["real", "authentic", "photograph", "genuine", "actual", "video frame"]
-    
-    ai_score_sum = 0.0
-    real_score_sum = 0.0
-    
-    for item in clip_response:
-        label = item.get("label", "").lower()
-        score = item.get("score", 0.0)
-        
-        # Check if label indicates AI-generated content
-        if any(keyword in label for keyword in ai_keywords):
-            ai_score_sum += score
-        # Check if label indicates real content
-        elif any(keyword in label for keyword in real_keywords):
-            real_score_sum += score
-    
-    # Normalize: AI score relative to total
-    total_score = ai_score_sum + real_score_sum
-    if total_score > 0:
-        ai_likelihood = ai_score_sum / total_score
+def _download_thumbnail_bytes(video_id: str) -> bytes:
+    """Download YouTube thumbnail bytes, trying maxres then hqdefault."""
+    for path in ["maxresdefault.jpg", "hqdefault.jpg"]:
+        url = f"https://img.youtube.com/vi/{video_id}/{path}"
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200 and r.content:
+                return r.content
+        except Exception:
+            pass
+    return None
+
+
+def _compute_center_crop_box(width: int, height: int, margin: float = 0.02) -> tuple:
+    """Compute centered 9:16 crop box with margin."""
+    target_ratio = 9 / 16
+    ratio = width / height if height else target_ratio
+    if ratio > target_ratio:
+        crop_w = int(round(height * target_ratio))
+        left = (width - crop_w) // 2
+        right = left + crop_w
+        top, bottom = 0, height
     else:
-        ai_likelihood = 0.5  # Neutral if no scores
-    
-    # Add slight bias toward caution (better to flag suspicious than miss AI content)
-    ai_likelihood = min(ai_likelihood * 1.1, 0.98)
-    
-    return round(ai_likelihood, 2)
+        crop_h = int(round(width / target_ratio))
+        top = (height - crop_h) // 2
+        bottom = top + crop_h
+        left, right = 0, width
+    dx = int((right - left) * margin)
+    dy = int((bottom - top) * margin)
+    return max(0, left + dx), max(0, top + dy), min(width, right - dx), min(height, bottom - dy)
+
+
+def _classify_haywood_bytes(image_bytes: bytes):
+    """Call haywoodsloan/ai-image-detector-dev-deploy via raw POST."""
+    url = "https://api-inference.huggingface.co/models/haywoodsloan/ai-image-detector-dev-deploy"
+    headers = {
+        "Authorization": f"Bearer {HUGGING_FACE_API_KEY}",
+        "Content-Type": "image/jpeg",
+    }
+    resp = requests.post(url, headers=headers, data=image_bytes, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(data["error"]) 
+    # Normalize elements to dicts if needed
+    normalized = []
+    for item in data:
+        label = item.get("label") if isinstance(item, dict) else getattr(item, "label", None)
+        score = item.get("score") if isinstance(item, dict) else getattr(item, "score", None)
+        if label is not None and score is not None:
+            normalized.append({"label": str(label), "score": float(score)})
+    return normalized
+
+
+# Legacy function - kept for compatibility but not used in new implementation
+def calculate_ai_score_from_clip(clip_response) -> float:
+    """Legacy function - not used in new haywoodsloan implementation."""
+    return 0.5

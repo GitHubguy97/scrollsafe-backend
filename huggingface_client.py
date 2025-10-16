@@ -40,59 +40,74 @@ async def analyze_with_huggingface(video_id: str) -> Dict:
                     heuristics_result_type = heuristics_result["result"]
                     ai_result_type = ai_result["result"]
                     
-                    # Case 1: Heuristics says "verified" (non-AI) - prioritize heuristics for reliability
-                    if heuristics_result_type == "verified":
-                        if ai_result_type == "verified":
-                            # Both agree it's real - trust heuristics with slight AI boost
-                            print(f"Both heuristics and AI say verified - trusting heuristics baseline")
-                            return {
-                                "result": "verified",
-                                "confidence": min(heuristics_result["confidence"] + 0.05, 0.95),
-                                "reason": f"Heuristics confirmed by AI analysis"
-                            }
-                        else:
-                            # AI says AI but heuristics says verified - trust heuristics for non-AI
-                            print(f"AI says {ai_result_type} but heuristics says verified - trusting heuristics for non-AI")
-                            return {
-                                "result": "verified",
-                                "confidence": heuristics_result["confidence"],
-                                "reason": f"Heuristics indicates authentic content, AI analysis inconclusive"
-                            }
+                    # Check if heuristics found explicit AI mentions (high confidence patterns)
+                    has_explicit_ai_mention = (
+                        heuristics_result_type == "ai-detected" and 
+                        heuristics_result["confidence"] >= 0.80
+                    )
                     
-                    # Case 2: Heuristics says "ai-detected" - balance with AI
-                    elif heuristics_result_type == "ai-detected":
-                        if ai_result_type == "ai-detected":
-                            # Both agree it's AI - combine confidence
-                            combined_confidence = min((heuristics_result["confidence"] + ai_result["confidence"]) / 2 + 0.1, 0.98)
-                            print(f"Both heuristics and AI say ai-detected - combining confidence")
+                    # Case 1: No explicit AI mention in metadata - heavily favor heuristics
+                    if not has_explicit_ai_mention:
+                        print(f"No explicit AI mention in metadata - heavily favoring heuristics")
+                        if heuristics_result_type == "verified":
+                            # Heuristics says verified + no AI mention = definitely verified
+                            print(f"Heuristics says verified + no AI mention = trusting heuristics")
                             return {
-                                "result": "ai-detected",
-                                "confidence": combined_confidence,
-                                "reason": f"Double confirmation: {heuristics_result['reason']}"
-                            }
-                        else:
-                            # AI says verified but heuristics says ai-detected - trust heuristics
-                            print(f"AI says verified but heuristics says ai-detected - trusting heuristics")
-                            return {
-                                "result": "ai-detected",
+                                "result": "verified",
                                 "confidence": min(heuristics_result["confidence"] + 0.1, 0.95),
-                                "reason": f"Heuristics override: {heuristics_result['reason']}"
+                                "reason": f"Heuristics indicates authentic content (no AI metadata found)"
                             }
-                    
-                    # Case 3: Heuristics says "suspicious" - let AI break the tie
-                    elif heuristics_result_type == "suspicious":
-                        if ai_result_type == "ai-detected":
-                            # AI confirms suspicious -> AI detected
-                            print(f"AI confirms suspicious heuristics - marking as ai-detected")
+                        elif heuristics_result_type == "suspicious":
+                            # Heuristics says suspicious + no AI mention = likely verified
+                            print(f"Heuristics says suspicious + no AI mention = trusting heuristics (verified)")
                             return {
-                                "result": "ai-detected",
-                                "confidence": min(ai_result["confidence"] + 0.05, 0.95),
-                                "reason": f"AI confirmed suspicious indicators: {ai_result['reason']}"
+                                "result": "verified",
+                                "confidence": 0.75,
+                                "reason": f"Heuristics suggests authentic content despite minor concerns (no AI metadata)"
                             }
                         else:
-                            # AI says verified despite suspicious heuristics - trust AI
-                            print(f"AI says verified despite suspicious heuristics - trusting AI")
-                            return ai_result
+                            # Heuristics says unknown + no AI mention = verified
+                            print(f"Heuristics says unknown + no AI mention = marking as verified")
+                            return {
+                                "result": "verified",
+                                "confidence": 0.80,
+                                "reason": f"No AI indicators found in metadata or heuristics"
+                            }
+                    
+                    # Case 2: Explicit AI mention found - balance heuristics and AI
+                    else:
+                        print(f"Explicit AI mention found - balancing heuristics and AI")
+                        if heuristics_result_type == "ai-detected":
+                            if ai_result_type == "ai-detected":
+                                # Both agree it's AI - combine confidence
+                                combined_confidence = min((heuristics_result["confidence"] + ai_result["confidence"]) / 2 + 0.1, 0.98)
+                                print(f"Both heuristics and AI say ai-detected - combining confidence")
+                                return {
+                                    "result": "ai-detected",
+                                    "confidence": combined_confidence,
+                                    "reason": f"Double confirmation: {heuristics_result['reason']}"
+                                }
+                            else:
+                                # AI says verified but heuristics says ai-detected - trust heuristics
+                                print(f"AI says verified but heuristics says ai-detected - trusting heuristics")
+                                return {
+                                    "result": "ai-detected",
+                                    "confidence": min(heuristics_result["confidence"] + 0.1, 0.95),
+                                    "reason": f"Heuristics override: {heuristics_result['reason']}"
+                                }
+                        elif heuristics_result_type == "suspicious":
+                            if ai_result_type == "ai-detected":
+                                # AI confirms suspicious -> AI detected
+                                print(f"AI confirms suspicious heuristics - marking as ai-detected")
+                                return {
+                                    "result": "ai-detected",
+                                    "confidence": min(ai_result["confidence"] + 0.05, 0.95),
+                                    "reason": f"AI confirmed suspicious indicators: {ai_result['reason']}"
+                                }
+                            else:
+                                # AI says verified despite suspicious heuristics - trust AI
+                                print(f"AI says verified despite suspicious heuristics - trusting AI")
+                                return ai_result
                 
                 # No heuristics baseline - trust AI result
                 return ai_result
@@ -106,22 +121,39 @@ async def analyze_with_huggingface(video_id: str) -> Dict:
     await asyncio.sleep(1.0)  # Simulate processing time
     
     if heuristics_result:
-        # If heuristics found AI, boost confidence for deep scan
-        if heuristics_result["result"] == "ai-detected":
+        # Check if heuristics found explicit AI mentions (high confidence patterns)
+        has_explicit_ai_mention = (
+            heuristics_result["result"] == "ai-detected" and 
+            heuristics_result["confidence"] >= 0.80
+        )
+        
+        if has_explicit_ai_mention:
+            # Explicit AI mention found - boost confidence for deep scan
+            print(f"Explicit AI mention found in heuristics - boosting confidence")
             return {
                 "result": "ai-detected",
                 "confidence": min(heuristics_result["confidence"] + 0.05, 0.98),
                 "reason": f"Deep scan confirmed: {heuristics_result['reason']}"
             }
         elif heuristics_result["result"] == "suspicious":
+            # Suspicious but no explicit AI mention - likely verified
+            print(f"Suspicious heuristics but no explicit AI mention - marking as verified")
             return {
-                "result": "ai-detected",
-                "confidence": heuristics_result["confidence"] + 0.15,
-                "reason": f"Deep analysis detected: {heuristics_result['reason']}"
+                "result": "verified",
+                "confidence": 0.75,
+                "reason": f"Heuristics suggests authentic content despite minor concerns (no explicit AI metadata)"
+            }
+        else:
+            # No AI indicators found - definitely verified
+            print(f"No AI indicators found in heuristics - marking as verified")
+            return {
+                "result": "verified",
+                "confidence": 0.85,
+                "reason": f"Heuristics found no AI indicators"
             }
     
-    # No AI indicators found
-    print(f"No AI indicators found, marking as verified")
+    # No heuristics available - default to verified
+    print(f"No heuristics available - defaulting to verified")
     return {
         "result": "verified",
         "confidence": 0.75,

@@ -10,7 +10,7 @@ from PIL import Image
 
 load_dotenv()
 
-HUGGING_FACE_API_KEY = os.getenv("HUGGING_FACE_API_KEY") or os.getenv("HF_TOKEN")
+HUGGING_FACE_API_KEY = os.getenv("HUGGING_FACE_API_KEY")
 
 async def analyze_with_huggingface(video_id: str) -> Dict:
     """
@@ -238,7 +238,7 @@ async def analyze_thumbnail_with_ai(video_id: str) -> Dict:
 def _download_thumbnail_bytes(video_id: str) -> bytes:
     """Download YouTube thumbnail bytes, trying maxres then hqdefault."""
     for path in ["maxresdefault.jpg", "hqdefault.jpg"]:
-        url = f"https://img.youtube.com/vi/{video_id}/{path}"
+        url = f"https://i.ytimg.com/vi/{video_id}/{path}"
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 200 and r.content:

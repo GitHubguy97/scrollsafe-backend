@@ -31,12 +31,16 @@ DOOM_SCROLLER_CACHE = {
     },   
 }
 
+# CORS Configuration - Secure settings for Chrome Extension
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your extension's origin
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"],  # Chrome extensions use chrome-extension://<id> origins
+                          # TODO: Replace with specific extension ID once published:
+                          # allow_origins=["chrome-extension://your-extension-id-here"]
+    allow_credentials=False,  # We don't use cookies or auth headers
+    allow_methods=["GET"],    # Only GET requests are used
+    allow_headers=["Accept", "Content-Type"],  # Minimal headers needed
+    max_age=3600,  # Cache preflight requests for 1 hour
 )
 
 
@@ -55,7 +59,7 @@ async def root():
 async def check_doom_scroller_cache(video_id: str):
     """Check if video is in Doom Scroller pre-analyzed cache"""
     if video_id in DOOM_SCROLLER_CACHE:
-        print(f"⚡ DS Cache hit for: {video_id}")
+        print(f"DS Cache hit for: {video_id}")
         cached = DOOM_SCROLLER_CACHE[video_id]
         return AnalysisResult(
             result=cached["result"],
@@ -65,7 +69,7 @@ async def check_doom_scroller_cache(video_id: str):
         )
     else:
         # Return 404 for cache miss
-        print(f"❌ DS Cache miss for: {video_id}")
+        print(f"DS Cache miss for: {video_id}")
         raise HTTPException(status_code=404, detail="Not in cache")
 
 @app.get("/api/analyze/{video_id}")

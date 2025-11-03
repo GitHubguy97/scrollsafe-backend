@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
 import time
 import json
+import os
+import logging
 from datetime import datetime
 from dotenv import load_dotenv
 from video_utils import get_video_info
@@ -11,25 +15,138 @@ from heuristics import check_heuristics
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from huggingface_client import analyze_with_huggingface
+import redis
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+from contextlib import asynccontextmanager
 
 # Load environment variables
 load_dotenv()
+
+DEFAULT_PLATFORM = os.getenv("DEFAULT_PLATFORM", "youtube")
+REDIS_URL = os.getenv("REDIS_APP_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+redis_client: Optional[redis.Redis] = None
+if REDIS_URL:
+    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+db_pool: Optional[ConnectionPool] = None
+if DATABASE_URL:
+    db_pool = ConnectionPool(
+        conninfo=DATABASE_URL,
+        min_size=int(os.getenv("DB_POOL_MIN_SIZE", "1")),
+        max_size=int(os.getenv("DB_POOL_MAX_SIZE", "10")),
+        timeout=float(os.getenv("DB_POOL_TIMEOUT", "30")),
+    )
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
 app = FastAPI(title="ScrollSafe Backend", version="1.0.0")
 
 # Create thread pool for blocking operations
 executor = ThreadPoolExecutor(max_workers=4)  # Handle 4 concurrent requests
 
-# Mock Doom Scroller Cache (simulates pre-analyzed viral content)
-DOOM_SCROLLER_CACHE = {
-    # AI-generated videos
-    "ZiuUF14tJtY": { 
-        "result": "ai-detected", 
-        "confidence": 0.87, 
-        "source": "DS Cache",
-        "reason": "Deepfake detection model flagged this video"
-    },   
-}
+def _format_analysis_result(data: Dict[str, Any], source: str) -> AnalysisResult:
+    label = data.get("label", "unknown")
+    confidence_raw = data.get("confidence")
+    try:
+        confidence = float(confidence_raw) if confidence_raw is not None else 0.0
+    except (TypeError, ValueError):
+        confidence = 0.0
+    reason = data.get("reason") or "model_vote"
+    return AnalysisResult(
+        result=label,
+        confidence=confidence,
+        reason=reason,
+        source=source,
+    )
+
+
+def _get_cache_hit(platform: str, video_id: str) -> Optional[AnalysisResult]:
+    if not redis_client:
+        return None
+    key = f"video:{platform}:{video_id}"
+    try:
+        cached = redis_client.get(key)
+    except Exception as exc:
+        logger.warning("Redis error while fetching %s: %s", key, exc)
+        return None
+
+    if not cached:
+        return None
+
+    try:
+        payload = json.loads(cached)
+    except json.JSONDecodeError:
+        logger.warning("Invalid JSON in cache for key %s", key)
+        return None
+
+    return _format_analysis_result(payload, source="Doomscroller Cache")
+
+
+def _get_db_hit(platform: str, video_id: str) -> Optional[AnalysisResult]:
+    if not db_pool:
+        return None
+
+    query = """
+        WITH merged AS (
+            SELECT
+                'admin' AS source,
+                label,
+                1.0 AS confidence,
+                COALESCE(notes, 'admin_override') AS reason,
+                NOW() AS analyzed_at,
+                NULL::jsonb AS features,
+                NULL::text AS source_url
+            FROM admin_labels
+            WHERE platform = %s AND video_id = %s
+
+            UNION ALL
+
+            SELECT
+                'analysis' AS source,
+                label,
+                confidence,
+                reason,
+                analyzed_at,
+                features,
+                source_url
+            FROM analyses
+            WHERE platform = %s AND video_id = %s
+        )
+        SELECT
+            source,
+            label,
+            confidence,
+            reason,
+            analyzed_at,
+            features,
+            source_url
+        FROM merged
+        ORDER BY (source = 'admin') DESC, analyzed_at DESC
+        LIMIT 1;
+    """
+
+    try:
+        with db_pool.connection() as conn:
+            conn: psycopg.Connection
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(query, (platform, video_id, platform, video_id))
+                row = cur.fetchone()
+    except Exception as exc:
+        logger.warning("Postgres error while fetching %s:%s - %s", platform, video_id, exc)
+        return None
+
+    if not row:
+        return None
+
+    source = "Admin Override" if row["source"] == "admin" else "Doomscroller DB"
+    return _format_analysis_result(row, source=source)
 
 # CORS Configuration - Secure settings for Chrome Extension
 app.add_middleware(
@@ -56,21 +173,22 @@ async def root():
     return {"message": "ScrollSafe Backend API"}
 
 @app.get("/api/ds-cache/{video_id}")
-async def check_doom_scroller_cache(video_id: str):
-    """Check if video is in Doom Scroller pre-analyzed cache"""
-    if video_id in DOOM_SCROLLER_CACHE:
-        print(f"DS Cache hit for: {video_id}")
-        cached = DOOM_SCROLLER_CACHE[video_id]
-        return AnalysisResult(
-            result=cached["result"],
-            confidence=cached["confidence"],
-            reason=cached["reason"],
-            source=cached["source"]
-        )
-    else:
-        # Return 404 for cache miss
-        print(f"DS Cache miss for: {video_id}")
-        raise HTTPException(status_code=404, detail="Not in cache")
+async def check_doom_scroller_cache(video_id: str, platform: Optional[str] = None):
+    """Check Doomscroller cache and database for a verdict."""
+    platform = (platform or DEFAULT_PLATFORM).lower()
+
+    cache_hit = _get_cache_hit(platform, video_id)
+    if cache_hit:
+        logger.info("DS cache hit for %s:%s", platform, video_id)
+        return cache_hit
+
+    db_hit = _get_db_hit(platform, video_id)
+    if db_hit:
+        logger.info("DS DB hit for %s:%s", platform, video_id)
+        return db_hit
+
+    logger.info("DS miss for %s:%s", platform, video_id)
+    raise HTTPException(status_code=404, detail="Not in cache")
 
 @app.get("/api/analyze/{video_id}")
 async def analyze_video(video_id: str, request: Request):
@@ -149,3 +267,11 @@ async def deep_scan_video(video_id: str, request: Request):
         source="Hybrid AI + Heuristics"
     )
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        yield
+    finally:
+        if db_pool:
+            db_pool.close()

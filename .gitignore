@@ -20,3 +20,10 @@ api_requests.log
 .vscode/
 .idea/
 
+.analyzer/
+.discover/
+
+.main_run.py
+.local_inference_tester.py
+.inference_tester.py
+.model_tester.py

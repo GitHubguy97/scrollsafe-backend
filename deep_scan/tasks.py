@@ -66,267 +66,559 @@ def _store_job_status(job_id: str, status: str, *, result: Optional[Dict[str, An
     client.set(_job_key(job_id), json.dumps(payload), ex=settings.redis_job_ttl_seconds)
 
 
-# def _build_yt_dlp_command(url: str) -> List[str]:
-#     cmd = [
-#         "yt-dlp",
-#         "-f",
-#         "bestvideo[height<=1080]/best",
-#         "-o",
-#         "-",
-#         "--quiet",
-#         "--no-warnings",
-#         "--no-part",
-#         url,
-#     ]
+# ==============================================================================
+# ROBUST FRAME EXTRACTION PIPELINE
+# ==============================================================================
+# Fast path: yt-dlp pipe → ffmpeg stdin (keeps speed)
+# Fallback A: Stricter progressive format
+# Fallback B: Direct URL → ffmpeg with headers
+# Fallback C: Temp file download
+# ==============================================================================
 
-#     cookie_browser = os.getenv("YTDLP_COOKIES_BROWSER")
-#     cookies_path = os.getenv("YTDLP_COOKIES_FILE")
-#     if cookie_browser:
-#         cmd.extend(["--cookies-from-browser", cookie_browser])
-#     elif cookies_path:
-#         cmd.extend(["--cookies", cookies_path])
-
-#     return cmd
+from enum import Enum
+import threading
 
 
-# def _build_ffmpeg_command(*, duration_seconds: float, target_frames: int, output_pattern: Path) -> List[str]:
-#     duration_seconds = max(duration_seconds, 0.001)
-#     fps_value = max(target_frames / duration_seconds, 0.01)
-#     filters = [
-#         f"fps=fps={fps_value:.8f}:round=up",
-#         "scale=-2:1080:force_original_aspect_ratio=decrease",
-#     ]
-#     return [
-#         "ffmpeg",
-#         "-hide_banner",
-#         "-loglevel",
-#         "error",
-#         "-nostdin",
-#         "-i",
-#         "pipe:0",
-#         "-an",
-#         "-vf",
-#         ",".join(filters),
-#         "-vsync",
-#         "vfr",
-#         "-frames:v",
-#         str(target_frames),
-#         "-q:v",
-#         "2",
-#         str(output_pattern),
-#     ]
+class ErrorClass(Enum):
+    """Classification of frame extraction errors."""
+    HLS_PARSE = "hls_parse"
+    AUTH_REQUIRED = "auth_required"
+    FORBIDDEN_403 = "forbidden_403"
+    RATE_LIMIT = "rate_limit"
+    UNKNOWN = "unknown"
 
 
-# def _extract_frames(url: str, target_frames: int, *, timeout: int) -> List[bytes]:
-#     metadata = _probe_stream_metadata(url)
-#     duration = metadata.get("duration") or 0.0
+def _classify_error(stderr: str) -> ErrorClass:
+    """Classify error from ffmpeg/yt-dlp stderr."""
+    stderr_lower = stderr.lower()
 
-#     with tempfile.TemporaryDirectory(prefix="deep_frames_") as tmpdir:
-#         tmp_path = Path(tmpdir)
-#         output_pattern = tmp_path / "frame_%03d.jpg"
+    if "403" in stderr_lower or "forbidden" in stderr_lower:
+        return ErrorClass.FORBIDDEN_403
+    if "401" in stderr_lower or "unauthorized" in stderr_lower:
+        return ErrorClass.AUTH_REQUIRED
+    if "429" in stderr_lower or "rate limit" in stderr_lower:
+        return ErrorClass.RATE_LIMIT
+    if "m3u8" in stderr_lower or "hls" in stderr_lower or "dash" in stderr_lower:
+        return ErrorClass.HLS_PARSE
 
-#         yt_cmd = _build_yt_dlp_command(url)
-#         ff_cmd = _build_ffmpeg_command(
-#             duration_seconds=duration,
-#             target_frames=target_frames,
-#             output_pattern=output_pattern,
-#         )
-
-#         try:
-#             ydl_proc = subprocess.Popen(yt_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-#         except FileNotFoundError as exc:
-#             raise RuntimeError("yt-dlp executable not found on PATH") from exc
-
-#         try:
-#             try:
-#                 subprocess.run(
-#                     ff_cmd,
-#                     stdin=ydl_proc.stdout,
-#                     stdout=subprocess.PIPE,
-#                     stderr=subprocess.PIPE,
-#                     check=True,
-#                     timeout=timeout,
-#                 )
-#             except FileNotFoundError as exc:
-#                 ydl_proc.kill()
-#                 raise RuntimeError("ffmpeg executable not found on PATH") from exc
-#             except subprocess.TimeoutExpired as exc:
-#                 ydl_proc.kill()
-#                 raise RuntimeError("ffmpeg timed out while extracting frames") from exc
-#             except subprocess.CalledProcessError as exc:
-#                 ydl_proc.kill()
-#                 stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else ""
-#                 raise RuntimeError(f"ffmpeg failed to extract frames: {stderr.strip()}") from exc
-#         finally:
-#             if ydl_proc.stdout:
-#                 ydl_proc.stdout.close()
-#             if ydl_proc.stderr:
-#                 ydl_proc.stderr.close()
-#             try:
-#                 ydl_proc.wait(timeout=5)
-#             except subprocess.TimeoutExpired:
-#                 ydl_proc.kill()
-#                 ydl_proc.wait(timeout=5)
-
-#         frame_files = sorted(tmp_path.glob("frame_*.jpg"))
-#         frames = [path.read_bytes() for path in frame_files[:target_frames]]
-#         if not frames:
-#             raise RuntimeError("No frames extracted from stream")
-#         return frames
+    return ErrorClass.UNKNOWN
 
 
-# def _probe_stream_metadata(url: str) -> Dict[str, Any]:
-#     try:
-#         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-#             info = ydl.extract_info(url, download=False)
-#             duration = info.get("duration")
-#             if info.get("_type") == "playlist":
-#                 entries = info.get("entries") or []
-#                 if entries:
-#                     duration = entries[0].get("duration")
-#             return {"duration": duration or 0.0}
-#     except DownloadError as exc:
-#         logger.warning("yt-dlp metadata probe failed: %s", exc)
-#     except Exception:
-#         logger.exception("Unexpected error probing stream metadata")
-#     return {"duration": 0.0}
+def _compute_fps(duration: float, target_frames: int) -> float:
+    """Compute FPS to extract target_frames evenly across duration."""
+    duration = max(duration, 0.001)
+    return max(target_frames / duration, 0.01)
 
 
-# fast_extract_frames.py
+def _get_cookie_config() -> Tuple[str, str]:
+    """Get cookie configuration from environment.
+    Returns (mode, value) where mode is 'file', 'browser', or 'none'.
+    """
+    cookies_file = os.getenv("YTDLP_COOKIES_FILE")
+    cookies_browser = os.getenv("YTDLP_COOKIES_BROWSER")
+
+    if cookies_file:
+        return ("file", cookies_file)
+    elif cookies_browser:
+        return ("browser", cookies_browser)
+    else:
+        return ("none", "")
 
 
-def _select_video_url(info: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
-    """Pick a direct playable URL + headers from yt-dlp's info dict."""
+def _probe_metadata(url: str) -> Tuple[float, Dict[str, str]]:
+    """Probe video metadata to get duration and headers.
+    Returns (duration, http_headers).
+    """
+    cookie_mode, cookie_value = _get_cookie_config()
+    logger.debug("Cookie mode: %s", cookie_mode)
+
+    ydl_opts = {
+        "format": "bestvideo*[protocol^=http][ext=mp4]/best[protocol^=http][ext=mp4]/best[protocol^=http]",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": 10,
+        "retries": 2,
+        "ignore_no_formats_error": True,
+    }
+
+    if cookie_mode == "file":
+        ydl_opts["cookiefile"] = cookie_value
+    elif cookie_mode == "browser":
+        ydl_opts["cookiesfrombrowser"] = (cookie_value,)
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+            # Handle playlist wrappers
+            if info.get("_type") == "playlist":
+                entries = info.get("entries") or []
+                if entries:
+                    info = entries[0]
+
+            # Extract duration (try multiple keys)
+            duration = 0.0
+            for key in ["duration", "duration_float", "duration_seconds"]:
+                val = info.get(key)
+                if val and float(val) > 0:
+                    duration = float(val)
+                    break
+
+            # Fallback to target_frames if no duration found
+            if duration <= 0:
+                duration = float(settings.target_frames)
+                logger.debug("No duration found, using target_frames as fallback: %.1f", duration)
+
+            headers = info.get("http_headers", {}) or {}
+
+            logger.debug("Probed metadata: duration=%.2fs, headers_keys=%s",
+                        duration, list(headers.keys()))
+
+            return (duration, headers)
+
+    except Exception as exc:
+        logger.warning("Metadata probe failed: %s, using defaults", exc)
+        return (float(settings.target_frames), {})
+
+
+def _build_yt_dlp_command(url: str, format_selector: str) -> List[str]:
+    """Build yt-dlp command for streaming to stdout."""
+    cookie_mode, cookie_value = _get_cookie_config()
+
+    cmd = [
+        "yt-dlp",
+        "-f", format_selector,
+        "--hls-use-mpegts",
+        "--retries", "5",
+        "--fragment-retries", "10",
+        "--concurrent-fragments", "5",
+        "--no-part",
+        "--quiet",
+        "--no-warnings",
+        "-o", "-",
+        url,
+    ]
+
+    if cookie_mode == "file":
+        cmd.extend(["--cookies", cookie_value])
+    elif cookie_mode == "browser":
+        cmd.extend(["--cookies-from-browser", cookie_value])
+
+    return cmd
+
+
+def _build_ffmpeg_command(duration: float, target_frames: int, output_pattern: Path) -> List[str]:
+    """Build ffmpeg command for extracting frames from stdin."""
+    fps = _compute_fps(duration, target_frames)
+
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-i", "pipe:0",
+        "-an",
+        "-vf", f"fps=fps={fps:.8f}:round=up,scale=-2:1080:force_original_aspect_ratio=decrease",
+        "-vsync", "vfr",
+        "-frames:v", str(target_frames),
+        "-q:v", "2",
+        str(output_pattern),
+    ]
+
+
+def _drain_stderr(proc: subprocess.Popen, output_list: List[str]):
+    """Thread function to drain stderr from a subprocess to avoid deadlock."""
+    try:
+        if proc.stderr:
+            for line in iter(proc.stderr.readline, b""):
+                output_list.append(line.decode("utf-8", errors="ignore"))
+    except Exception:
+        pass
+
+
+def _try_fast_path(url: str, target_frames: int, duration: float, format_selector: str, timeout: int, tmpdir: Path) -> Tuple[bool, str]:
+    """Try fast path: yt-dlp pipe → ffmpeg stdin.
+    Returns (success, error_message).
+    """
+    output_pattern = tmpdir / "frame_%03d.jpg"
+
+    yt_cmd = _build_yt_dlp_command(url, format_selector)
+    ff_cmd = _build_ffmpeg_command(duration, target_frames, output_pattern)
+
+    logger.debug("Fast path attempt with format: %s", format_selector)
+    logger.debug("yt-dlp command: %s", " ".join(yt_cmd))
+    logger.debug("ffmpeg command: %s", " ".join(ff_cmd))
+
+    ydl_stderr_lines: List[str] = []
+
+    try:
+        ydl_proc = subprocess.Popen(yt_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        return (False, "yt-dlp executable not found on PATH")
+
+    # Start thread to drain yt-dlp stderr
+    stderr_thread = threading.Thread(target=_drain_stderr, args=(ydl_proc, ydl_stderr_lines), daemon=True)
+    stderr_thread.start()
+
+    try:
+        try:
+            result = subprocess.run(
+                ff_cmd,
+                stdin=ydl_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=timeout,
+            )
+        except FileNotFoundError:
+            ydl_proc.kill()
+            return (False, "ffmpeg executable not found on PATH")
+        except subprocess.TimeoutExpired:
+            ydl_proc.kill()
+            return (False, "ffmpeg timed out while extracting frames")
+        except subprocess.CalledProcessError as exc:
+            ydl_proc.kill()
+            stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else ""
+            return (False, f"ffmpeg failed: {stderr.strip()}")
+    finally:
+        if ydl_proc.stdout:
+            ydl_proc.stdout.close()
+        try:
+            ydl_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            ydl_proc.kill()
+            ydl_proc.wait(timeout=5)
+
+        stderr_thread.join(timeout=1)
+
+    # Check if frames were produced
+    frame_files = sorted(tmpdir.glob("frame_*.jpg"))
+    if not frame_files:
+        ydl_stderr = "".join(ydl_stderr_lines)
+        return (False, f"No frames produced. yt-dlp stderr: {ydl_stderr[:500]}")
+
+    return (True, "")
+
+
+def _select_media_format(info: Dict[str, Any]) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
+    """Select best media format and return (url, headers, format_info)."""
     if "entries" in info and info["entries"]:
         info = info["entries"][0]
 
     headers = info.get("http_headers", {}) or {}
 
-    # If yt-dlp already chose formats, prefer an actual video one
+    # Try requested_formats first
     if info.get("requested_formats"):
-        for f in info["requested_formats"]:
-            if f.get("vcodec") != "none" and f.get("url"):
-                return f["url"], headers or f.get("http_headers", {})
+        for fmt in info["requested_formats"]:
+            if fmt.get("vcodec") != "none" and fmt.get("url"):
+                return (fmt["url"], headers or fmt.get("http_headers", {}), fmt)
 
-    # Otherwise choose a good candidate from formats
+    # Select from available formats
     fmts = [f for f in (info.get("formats") or []) if f.get("url")]
     video_fmts = [f for f in fmts if f.get("vcodec") and f["vcodec"] != "none"]
     candidates = video_fmts or fmts
+
     if not candidates and info.get("url"):
-        return info["url"], headers
+        return (info["url"], headers, {})
 
     def score(f):
-        return (
-            1 if f.get("ext") == "mp4" else 0,
-            f.get("height") or 0,
-            f.get("tbr") or 0,
-        )
+        is_mp4 = 1 if f.get("ext") == "mp4" else 0
+        is_http = 1 if str(f.get("protocol", "")).startswith("http") else 0
+        height = min(f.get("height") or 0, 1080)
+        tbr = f.get("tbr") or 0
+        return (is_http, is_mp4, height, tbr)
+
     candidates.sort(key=score, reverse=True)
     best = candidates[0]
-    return best["url"], headers or best.get("http_headers", {})
+
+    logger.debug("Selected format: id=%s ext=%s height=%s tbr=%s protocol=%s",
+                 best.get("format_id"), best.get("ext"), best.get("height"),
+                 best.get("tbr"), best.get("protocol"))
+
+    return (best["url"], headers or best.get("http_headers", {}), best)
 
 
-def _headers_to_ffmpeg_args(headers: Dict[str, str]) -> list:
-    args: list = []
+def _headers_to_ffmpeg_args(headers: Dict[str, str]) -> List[str]:
+    """Convert HTTP headers to ffmpeg command-line arguments."""
+    args: List[str] = []
+
+    # Build headers string
+    header_lines = []
     for k, v in (headers or {}).items():
-        args += ["-headers", f"{k}: {v}"]
+        header_lines.append(f"{k}: {v}")
+
+    if header_lines:
+        args.extend(["-headers", "\r\n".join(header_lines)])
+
+    # Special handling for User-Agent and Referer
     if headers.get("User-Agent"):
-        args += ["-user_agent", headers["User-Agent"]]
+        args.extend(["-user_agent", headers["User-Agent"]])
     if headers.get("Referer"):
-        args += ["-referer", headers["Referer"]]
+        args.extend(["-referer", headers["Referer"]])
+
     return args
 
 
-def _ffprobe_duration(media_url: str, headers: Dict[str, str]) -> float:
-    """Try to get duration via ffprobe; return 0.0 on failure."""
-    hdr_args = _headers_to_ffmpeg_args(headers)
-    cmd = [
-        "ffprobe",
-        *hdr_args,
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=nw=1:nk=1",
-        media_url,
-    ]
-    try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
-        return float(out)
-    except Exception:
-        return 0.0
-
-
-def _extract_frames(url: str, target_frames: int, *, timeout: int) -> list[bytes]:
+def _try_fallback_b(url: str, target_frames: int, timeout: int, tmpdir: Path) -> Tuple[bool, str]:
+    """Fallback B: Direct URL → ffmpeg with headers.
+    Returns (success, error_message).
     """
-    Resolve a direct media URL with yt-dlp, then have FFmpeg pull frames
-    (evenly spaced across the whole duration) **fast** and return them as bytes.
-    """
-    # Resolve a playable URL + headers
+    logger.info("Attempting Fallback B: Direct URL to ffmpeg")
+
+    cookie_mode, cookie_value = _get_cookie_config()
+
     ydl_opts = {
+        "format": "bestvideo*[protocol^=http][ext=mp4]/best[protocol^=http][ext=mp4]/best[protocol^=http]",
+        "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
         "skip_download": True,
-        "format": "bestvideo*[protocol^=http]/best[protocol^=http]/bestvideo/best",
     }
-    # Optional cookie support via env vars (useful for IG/TT)
-    cookies_file = os.getenv("YTDLP_COOKIES_FILE")
-    cookies_browser = os.getenv("YTDLP_COOKIES_BROWSER")
-    if cookies_file:
-        ydl_opts["cookiefile"] = cookies_file
-    elif cookies_browser:
-        ydl_opts["cookiesfrombrowser"] = (cookies_browser,)
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    if cookie_mode == "file":
+        ydl_opts["cookiefile"] = cookie_value
+    elif cookie_mode == "browser":
+        ydl_opts["cookiesfrombrowser"] = (cookie_value,)
 
-    media_url, headers = _select_video_url(info)
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-    # Duration: prefer yt-dlp's, else ffprobe, else fallback
-    duration = float(info.get("duration") or 0.0)
-    if duration <= 0:
-        duration = _ffprobe_duration(media_url, headers)
-    if duration <= 0:
-        duration = 1.0  # avoid div-by-zero; may bias toward early frames
+        media_url, headers, fmt_info = _select_media_format(info)
 
-    # Compute fps to get ~target_frames across full length
-    fps = max(target_frames / duration, 0.01)
-    hdr_args = _headers_to_ffmpeg_args(headers)
+        # Get duration
+        duration = 0.0
+        for key in ["duration", "duration_float", "duration_seconds"]:
+            val = info.get(key)
+            if val and float(val) > 0:
+                duration = float(val)
+                break
 
-    with tempfile.TemporaryDirectory(prefix="fast_frames_") as tmpdir:
-        out_dir = Path(tmpdir)
-        out_pattern = str(out_dir / "%05d.jpg")
+        if duration <= 0:
+            duration = float(target_frames)
+
+        fps = _compute_fps(duration, target_frames)
+        hdr_args = _headers_to_ffmpeg_args(headers)
+        output_pattern = tmpdir / "frame_%03d.jpg"
+
+        # Check if HLS - add protocol whitelist
+        is_hls = ".m3u8" in media_url or fmt_info.get("protocol") == "m3u8"
+        protocol_args = []
+        if is_hls:
+            protocol_args = ["-protocol_whitelist", "file,http,https,tcp,tls,crypto"]
 
         ff_cmd = [
             "ffmpeg",
-            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            *protocol_args,
             *hdr_args,
             "-i", media_url,
+            "-an",
             "-vf", f"fps=fps={fps:.8f}:round=up,scale=-2:1080:force_original_aspect_ratio=decrease",
+            "-vsync", "vfr",
+            "-frames:v", str(target_frames),
             "-q:v", "2",
-            out_pattern,
+            str(output_pattern),
         ]
 
-        try:
-            subprocess.run(
-                ff_cmd,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("ffmpeg timed out while extracting frames") from exc
-        except subprocess.CalledProcessError as exc:
-            stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else ""
-            raise RuntimeError(f"ffmpeg failed to extract frames: {stderr.strip()}") from exc
+        logger.debug("Fallback B ffmpeg command: %s", " ".join(ff_cmd[:10]) + "...")
 
-        # Read back bytes (keeps the fast path: ffmpeg → files; then load to memory)
-        frame_files = sorted(out_dir.glob("*.jpg"))
+        subprocess.run(
+            ff_cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+
+        frame_files = sorted(tmpdir.glob("frame_*.jpg"))
         if not frame_files:
-            raise RuntimeError("No frames produced by ffmpeg")
+            return (False, "No frames produced in Fallback B")
 
-        # Only take up to target_frames, in order
+        return (True, "")
+
+    except subprocess.TimeoutExpired:
+        return (False, "Fallback B: ffmpeg timed out")
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else ""
+        return (False, f"Fallback B failed: {stderr[:500]}")
+    except Exception as exc:
+        return (False, f"Fallback B exception: {str(exc)}")
+
+
+def _try_fallback_c(url: str, target_frames: int, timeout: int, tmpdir: Path) -> Tuple[bool, str]:
+    """Fallback C: Download temp file, then extract frames.
+    Returns (success, error_message).
+    """
+    logger.info("Attempting Fallback C: Temp file download")
+
+    cookie_mode, cookie_value = _get_cookie_config()
+
+    temp_video = tmpdir / "temp_video.mp4"
+
+    ydl_opts = {
+        "format": "best[ext=mp4][protocol^=http]/best[protocol^=http]",
+        "outtmpl": str(temp_video),
+        "no_part": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    if cookie_mode == "file":
+        ydl_opts["cookiefile"] = cookie_value
+    elif cookie_mode == "browser":
+        ydl_opts["cookiesfrombrowser"] = (cookie_value,)
+
+    try:
+        # Download video
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        if not temp_video.exists():
+            return (False, "Fallback C: Download produced no file")
+
+        # Get duration from downloaded file
+        try:
+            probe_cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=nw=1:nk=1",
+                str(temp_video),
+            ]
+            duration_str = subprocess.check_output(probe_cmd, stderr=subprocess.STDOUT, text=True).strip()
+            duration = float(duration_str)
+        except Exception:
+            duration = float(target_frames)
+
+        fps = _compute_fps(duration, target_frames)
+        output_pattern = tmpdir / "frame_%03d.jpg"
+
+        ff_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", str(temp_video),
+            "-an",
+            "-vf", f"fps=fps={fps:.8f}:round=up,scale=-2:1080:force_original_aspect_ratio=decrease",
+            "-vsync", "vfr",
+            "-frames:v", str(target_frames),
+            "-q:v", "2",
+            str(output_pattern),
+        ]
+
+        subprocess.run(
+            ff_cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+
+        frame_files = sorted(tmpdir.glob("frame_*.jpg"))
+        if not frame_files:
+            return (False, "Fallback C: No frames extracted from temp file")
+
+        return (True, "")
+
+    except subprocess.TimeoutExpired:
+        return (False, "Fallback C: ffmpeg timed out")
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else ""
+        return (False, f"Fallback C failed: {stderr[:500]}")
+    except Exception as exc:
+        return (False, f"Fallback C exception: {str(exc)}")
+    finally:
+        # Clean up temp video
+        if temp_video.exists():
+            try:
+                temp_video.unlink()
+            except Exception:
+                pass
+
+
+def _extract_frames(url: str, target_frames: int, *, timeout: int) -> List[bytes]:
+    """
+    Robust frame extraction with fast path + fallbacks.
+
+    Pipeline:
+    1. Probe metadata (duration + headers)
+    2. Fast path: yt-dlp pipe → ffmpeg (progressive MP4 preference)
+    3. Fallback A: Stricter progressive format
+    4. Fallback B: Direct URL → ffmpeg with headers
+    5. Fallback C: Temp file download
+
+    Returns list of JPEG frame bytes, evenly spaced across video duration.
+    """
+    start_time = time.perf_counter()
+    logger.info("Starting frame extraction for %s (target: %d frames)", url, target_frames)
+
+    # Step 1: Probe metadata
+    duration, headers = _probe_metadata(url)
+    logger.info("Probed duration: %.2fs", duration)
+
+    with tempfile.TemporaryDirectory(prefix="deep_frames_") as tmpdir_str:
+        tmpdir = Path(tmpdir_str)
+
+        # Step 2: Try fast path (primary format)
+        format_primary = "bestvideo*[protocol^=http][ext=mp4]/best[protocol^=http][ext=mp4]/best[protocol^=http]"
+        success, error = _try_fast_path(url, target_frames, duration, format_primary, timeout, tmpdir)
+
+        if success:
+            logger.info("Fast path succeeded with primary format")
+        else:
+            logger.warning("Fast path failed: %s", error[:200])
+            error_class = _classify_error(error)
+            logger.debug("Error classified as: %s", error_class.value)
+
+            # Step 3: Fallback A - Stricter progressive
+            logger.info("Trying Fallback A: Stricter progressive format")
+            format_strict = "best[ext=mp4][protocol^=http]/best[protocol^=http]"
+            success, error_a = _try_fast_path(url, target_frames, duration, format_strict, timeout, tmpdir)
+
+            if success:
+                logger.info("Fallback A succeeded")
+            else:
+                logger.warning("Fallback A failed: %s", error_a[:200])
+
+                # Step 4: Fallback B - Direct URL
+                success, error_b = _try_fallback_b(url, target_frames, timeout, tmpdir)
+
+                if success:
+                    logger.info("Fallback B succeeded")
+                else:
+                    logger.warning("Fallback B failed: %s", error_b[:200])
+
+                    # Step 5: Fallback C - Temp file
+                    success, error_c = _try_fallback_c(url, target_frames, timeout, tmpdir)
+
+                    if success:
+                        logger.info("Fallback C succeeded")
+                    else:
+                        # All fallbacks failed
+                        error_class = _classify_error(error + error_a + error_b + error_c)
+                        raise RuntimeError(
+                            f"All extraction attempts failed. Error type: {error_class.value}. "
+                            f"Primary: {error[:100]} | FallbackA: {error_a[:100]} | "
+                            f"FallbackB: {error_b[:100]} | FallbackC: {error_c[:100]}"
+                        )
+
+        # Read frames
+        frame_files = sorted(tmpdir.glob("frame_*.jpg"))
+        if not frame_files:
+            raise RuntimeError("Frame extraction succeeded but no frame files found")
+
         frames: List[bytes] = [p.read_bytes() for p in frame_files[:target_frames]]
+
+        if len(frames) < target_frames:
+            logger.debug("Extracted %d/%d frames (fewer than requested)", len(frames), target_frames)
+
+        elapsed = time.perf_counter() - start_time
+        logger.info("Frame extraction completed: %d frames in %.2fs", len(frames), elapsed)
+
         return frames
 
 

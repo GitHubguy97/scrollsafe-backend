@@ -44,10 +44,6 @@ def _job_key(job_id: str) -> str:
     return f"deep:job:{job_id}"
 
 
-def _video_cache_key(platform: str, video_id: str) -> str:
-    return f"video:{platform}:{video_id}"
-
-
 def _lock_key(platform: str, video_id: str) -> str:
     return f"deep:lock:{platform}:{video_id}"
 
@@ -661,41 +657,184 @@ def _call_inference(frames: Sequence[bytes]) -> Dict[str, Any]:
 
 
 def _aggregate_inference(inference: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Aggregate inference results using doomscroller's proven decision logic.
+    Uses sophisticated thresholds and rules instead of simple vote counting.
+    """
     results = inference.get("results") or []
     if not results:
         raise ValueError("Inference payload did not contain frame results")
 
-    totals: Counter[str] = Counter()
-    max_scores: List[float] = []
-    frame_details: List[Dict[str, Any]] = []
+    # Collect scores from each frame
+    label_scores_list: List[Dict[str, float]] = []
+    vote_totals = {"real": 0.0, "artificial": 0.0}
 
     for entry in results:
-        scores = entry.get("label_scores") or {}
-        if not scores:
-            continue
-        best_label, best_score = max(scores.items(), key=lambda item: item[1])
-        totals[best_label] += 1
-        max_scores.append(float(best_score))
-        frame_details.append({"label": best_label, "scores": scores})
+        scores = entry.get("label_scores", {}) or {}
+        real_score = float(scores.get("real", 0.0))
+        artificial_score = float(scores.get("artificial", 0.0))
 
-    if not totals:
-        raise ValueError("Inference results contained empty scores")
+        label_scores_list.append({
+            "real": real_score,
+            "artificial": artificial_score,
+        })
+        vote_totals["real"] += real_score
+        vote_totals["artificial"] += artificial_score
 
-    total_frames = sum(totals.values())
-    vote_share = {label: count / total_frames for label, count in totals.items()}
-    majority_label = max(vote_share.items(), key=lambda item: item[1])[0]
-    confidence = sum(max_scores) / len(max_scores)
+    # Calculate vote share percentages
+    total_votes = vote_totals["real"] + vote_totals["artificial"] or 1.0
+    vote_share = {
+        "real": vote_totals["real"] / total_votes,
+        "artificial": vote_totals["artificial"] / total_votes,
+    }
+
+    # Use doomscroller's decision logic
+    decision = _decide_label(label_scores_list)
+    internal_label = decision["label"]
+
+    # Map internal labels to external labels
+    label_map = {
+        "artificial": "ai-detected",
+        "real": "verified",
+        "suspicious": "suspicious",
+        "unknown": "unknown",
+    }
+    external_label = label_map.get(internal_label, "unknown")
+    confidence = float(decision.get("confidence", 0.0))
+    reason = decision.get("reason", "model_vote")
+    features = decision.get("features", {})
+
+    # Add batch timing
+    features["batch_time_ms"] = inference.get("batch_time_ms")
 
     return {
         "vote_share": vote_share,
-        "label": majority_label,
+        "label": external_label,
         "confidence": confidence,
-        "reason": f"model_vote:{majority_label}",
-        "features": {
-            "frame_count": total_frames,
-            "frame_details": frame_details,
-            "batch_time_ms": inference.get("batch_time_ms"),
-        },
+        "reason": f"model_vote: {reason}",
+        "features": features,
+    }
+
+
+def _decide_label(scores_list: List[Dict[str, float]]) -> Dict[str, Any]:
+    """
+    Doomscroller's proven classification logic.
+
+    Decision rules:
+    1. Too few frames (<4) → unknown
+    2. Strong artificial signal → artificial
+    3. Mixed/suspicious signal → suspicious
+    4. Strong real signal → real
+    5. Default → unknown
+    """
+    total_frames = len(scores_list)
+    artificial_scores = [scores["artificial"] for scores in scores_list]
+
+    # Count votes: if artificial_score >= real_score, count as "artificial" vote
+    vote_counts = {"real": 0, "artificial": 0}
+    for scores in scores_list:
+        if scores["artificial"] >= scores["real"]:
+            vote_counts["artificial"] += 1
+        else:
+            vote_counts["real"] += 1
+
+    # Calculate statistics on artificial scores
+    if artificial_scores:
+        sorted_artificial = sorted(artificial_scores, reverse=True)
+        max_artificial = sorted_artificial[0]
+        top3 = sorted_artificial[:3]
+        top3_mean = sum(top3) / len(top3) if top3 else 0.0
+    else:
+        sorted_artificial = []
+        max_artificial = 0.0
+        top3 = []
+        top3_mean = 0.0
+
+    # Count frames exceeding thresholds
+    count_a90 = sum(score >= 0.90 for score in artificial_scores)
+    count_a80 = sum(score >= 0.80 for score in artificial_scores)
+    frac_a90 = count_a90 / total_frames if total_frames else 0.0
+    frac_a80 = count_a80 / total_frames if total_frames else 0.0
+
+    majority_label = (
+        "artificial"
+        if vote_counts["artificial"] >= vote_counts["real"]
+        else "real"
+    )
+
+    # Build features object for storage
+    features = {
+        "majority_label": majority_label,
+        "real_votes": vote_counts["real"],
+        "artificial_votes": vote_counts["artificial"],
+        "total_frames": total_frames,
+        "max_artificial": max_artificial,
+        "top3_mean_artificial": top3_mean,
+        "count_a90": count_a90,
+        "count_a80": count_a80,
+        "frac_a90": frac_a90,
+        "frac_a80": frac_a80,
+    }
+
+    # Rule 1: Too few frames
+    if total_frames < 4:
+        return {
+            "label": "unknown",
+            "confidence": 0.0,
+            "reason": "too_few_frames",
+            "features": features,
+        }
+
+    # Rule 2: Strong artificial signal
+    if (
+        frac_a90 >= 0.5  # >= 50% of frames score artificial >= 0.90
+        or (count_a90 >= 3 and top3_mean >= 0.96)  # 3+ frames at 0.90+, top 3 average >= 0.96
+        or (
+            count_a90 >= 3  # 3+ frames at 0.90+
+            and len(sorted_artificial) >= 3
+            and min(sorted_artificial[:3]) >= 0.94  # lowest of top 3 >= 0.94
+        )
+    ):
+        return {
+            "label": "artificial",
+            "confidence": max_artificial,
+            "reason": "strong_artificial",
+            "features": features,
+        }
+
+    # Rule 3: Suspicious signal
+    if (
+        (1 <= count_a90 <= 3 and top3_mean >= 0.92)  # 1-3 frames at 0.90+, top 3 avg >= 0.92
+        or (0.10 <= frac_a80 <= 0.40 and top3_mean >= 0.88)  # 10-40% of frames >= 0.80, top 3 avg >= 0.88
+    ):
+        return {
+            "label": "suspicious",
+            "confidence": max_artificial,
+            "reason": "mixed_signal",
+            "features": features,
+        }
+
+    # Rule 4: Strong real signal
+    real_votes = vote_counts["real"]
+    if (
+        real_votes >= max(total_frames * 0.6, 8)  # 60% of frames vote "real" OR at least 8 frames
+        and count_a90 <= 1  # 0-1 frames at 0.90+ artificial
+        and max_artificial < 0.90  # max artificial score < 0.90
+        and frac_a80 <= 0.20  # <= 20% of frames >= 0.80 artificial
+    ):
+        return {
+            "label": "real",
+            "confidence": max(1.0 - max_artificial, 0.0),
+            "reason": "consistent_real",
+            "features": features,
+        }
+
+    # Rule 5: Default (no clear signal)
+    return {
+        "label": "unknown",
+        "confidence": max(1.0 - max_artificial, max_artificial),
+        "reason": "no_rule_match",
+        "features": features,
     }
 
 
@@ -742,28 +881,6 @@ def _apply_heuristics(
         "reason": reason,
         "features": features,
     }
-
-
-def _cache_video_result(
-    *,
-    platform: str,
-    video_id: str,
-    result: Dict[str, Any],
-    analyzed_at: datetime,
-    vote_share: Dict[str, float],
-) -> None:
-    payload = {
-        "platform": platform,
-        "video_id": video_id,
-        "label": result["label"],
-        "confidence": result["confidence"],
-        "reason": result["reason"],
-        "vote_share": vote_share,
-        "analyzed_at": analyzed_at.isoformat(),
-        "model_version": settings.model_version,
-    }
-    client = _redis_client()
-    client.set(_video_cache_key(platform, video_id), json.dumps(payload), ex=settings.redis_job_ttl_seconds)
 
 
 @shared_task(name="deep_scan.tasks.process_job", queue=settings.queue_name)
@@ -817,13 +934,6 @@ def process_deep_scan_job(job_id: str, payload: Dict[str, Any]) -> None:
         logger.info("Deep scan result job_id=%s platform=%s video_id=%s label=%s confidence=%.4f", job_id, platform, video_id, final_result['label'], final_result['confidence'])
 
         _store_job_status(job_id, "done", result=final_result)
-        _cache_video_result(
-            platform=platform,
-            video_id=video_id,
-            result=final_result,
-            vote_share=aggregate["vote_share"],
-            analyzed_at=analyzed_at,
-        )
 
         duration_ms = (time.perf_counter() - started_at) * 1000
         logger.info(

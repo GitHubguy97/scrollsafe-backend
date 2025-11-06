@@ -61,6 +61,22 @@ def extract_platform_and_id(url: str) -> tuple[str, str]:
             raise ValueError("Unable to extract YouTube video ID from URL")
         return platform, video_id
 
+    if "instagram" in host:
+        platform = "instagram"
+        video_id = None
+
+        segments = path.split("/")
+        # Handle /p/{id}/ (Open-Post View)
+        if len(segments) >= 2 and segments[0] == "p":
+            video_id = _clean_video_id(segments[1])
+        # Handle /reels/{id}/ or /reel/{id}/
+        elif len(segments) >= 2 and segments[0] in ("reels", "reel"):
+            video_id = _clean_video_id(segments[1])
+
+        if not video_id:
+            raise ValueError("Unable to extract Instagram video ID from URL")
+        return platform, video_id
+
     raise ValueError("Unsupported platform in URL")
 
 

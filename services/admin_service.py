@@ -14,38 +14,70 @@ from .utils import to_float, extract_platform_and_id
 logger = logging.getLogger(__name__)
 
 
-def _scan_priority_keys(redis_conn: redis.Redis, queue_name: str) -> List[str]:
-    pattern = f"{queue_name}\x06\x16*"
-    keys: List[str] = []
-    cursor = 0
-    while True:
-        cursor, batch = redis_conn.scan(cursor=cursor, match=pattern, count=128)
-        if batch:
-            keys.extend(batch)
-        if cursor == 0:
-            break
-    return keys
-
-
 def queue_depth(redis_conn: Optional[redis.Redis], queue_name: str) -> Optional[int]:
+    """
+    Get accurate queue depth for Celery queue in Redis.
+
+    For Celery 5.x with Redis broker:
+    - Main queue: stored as list at key `queue_name`
+    - Priority queues: stored with keys like `queue_name\x06\x16{priority_number}`
+    - Unacked tasks: not included (they're being processed, not pending)
+
+    Returns total number of pending tasks across all priority levels.
+    """
     if not redis_conn:
         return None
+
     total = 0
+
     try:
-        total += redis_conn.llen(queue_name)
-    except redis.RedisError:
-        pass
-    try:
-        priority_keys = _scan_priority_keys(redis_conn, queue_name)
-        for key in priority_keys:
-            try:
-                total += redis_conn.llen(key)
-            except redis.RedisError:
-                continue
+        # Count main queue (default priority)
+        main_queue_len = redis_conn.llen(queue_name)
+        total += main_queue_len
+        logger.debug(f"Queue {queue_name}: main queue length = {main_queue_len}")
+
+        # Scan for priority queue variants
+        # Celery priority queues use format: queue_name + "\x06\x16" + priority_level
+        # Need to escape properly for Redis SCAN pattern
+        cursor = "0"
+        priority_count = 0
+
+        # Use SCAN to find all keys matching the priority pattern
+        # Pattern needs proper escaping: queue_name followed by any characters
+        while cursor != 0:
+            cursor, keys = redis_conn.scan(
+                cursor=int(cursor) if isinstance(cursor, str) else cursor,
+                match=f"{queue_name}*",  # Match queue name with any suffix
+                count=100
+            )
+
+            for key in keys:
+                # Skip the main queue (already counted)
+                if key == queue_name:
+                    continue
+
+                # Check if this is a priority queue (contains the separator)
+                # The separator is \x06\x16 between queue name and priority
+                key_str = key.decode('utf-8') if isinstance(key, bytes) else key
+                if key_str.startswith(queue_name) and '\x06\x16' in key_str:
+                    try:
+                        priority_len = redis_conn.llen(key)
+                        total += priority_len
+                        priority_count += priority_len
+                        logger.debug(f"Queue {queue_name}: priority key {key_str} length = {priority_len}")
+                    except redis.RedisError as e:
+                        logger.warning(f"Failed to get length of priority key {key_str}: {e}")
+                        continue
+
+        if priority_count > 0:
+            logger.debug(f"Queue {queue_name}: total priority tasks = {priority_count}")
+
+        logger.info(f"Queue {queue_name}: total depth = {total} (main: {main_queue_len}, priority: {priority_count})")
+        return total
+
     except redis.RedisError as exc:
-        logger.warning("Redis error while fetching queue depth for %s: %s", queue_name, exc)
+        logger.error(f"Redis error while fetching queue depth for {queue_name}: {exc}")
         return None
-    return total
 
 
 def build_admin_metrics(

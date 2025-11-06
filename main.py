@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
@@ -32,6 +32,7 @@ DEFAULT_PLATFORM = os.getenv("DEFAULT_PLATFORM", "youtube")
 REDIS_URL = os.getenv("REDIS_APP_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 BROKER_URL = os.getenv("CELERY_BROKER_URL")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")  # Required for admin routes
 
 redis_client: Optional[redis.Redis] = None
 if REDIS_URL:
@@ -76,7 +77,7 @@ app.add_middleware(
                           # allow_origins=["chrome-extension://your-extension-id-here"]
     allow_credentials=False,  # We don't use cookies or auth headers
     allow_methods=["GET", "POST", "OPTIONS"],    # Allow read + deep-scan creation + preflight
-    allow_headers=["Accept", "Content-Type", "Access-Control-Request-Private-Network"],  # Include PNA header
+    allow_headers=["Accept", "Content-Type", "Access-Control-Request-Private-Network", "X-API-Key"],  # Include PNA header and API key
     max_age=3600,  # Cache preflight requests for 1 hour
 )
 
@@ -88,6 +89,27 @@ async def add_private_network_access_headers(request: Request, call_next):
     # Add PNA header to allow requests from public sites to local network
     response.headers["Access-Control-Allow-Private-Network"] = "true"
     return response
+
+
+# Admin API Key Authentication
+def verify_admin_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    """Verify admin API key from X-API-Key header."""
+    if not ADMIN_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Admin API key not configured on server"
+        )
+    if not x_api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key"
+        )
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key"
+        )
+    return x_api_key
 
 
 class AnalysisResult(BaseModel):
@@ -174,6 +196,16 @@ class AdminLabelResponse(BaseModel):
 async def root():
     return {"message": "ScrollSafe Backend API"}
 
+@app.get("/health")
+async def health():
+    """Health check endpoint for Docker healthcheck and load balancers."""
+    return {
+        "status": "healthy",
+        "redis": redis_client is not None,
+        "database": db_pool is not None,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
 @app.get("/api/ds-cache/{video_id}")
 async def check_doom_scroller_cache(video_id: str, platform: Optional[str] = None):
     """Check Doomscroller cache and database for a verdict."""
@@ -201,6 +233,18 @@ async def analyze_video_post(payload: AnalyzeRequest, request: Request):
 
     if await request.is_disconnected():
         raise HTTPException(status_code=499, detail="Client disconnected")
+
+    # Check cache and database BEFORE running heuristics (important for admin labels)
+    if video_id:
+        cache_hit = get_cache_hit(redis_client, platform, video_id)
+        if cache_hit:
+            logger.info("Cache hit for %s:%s in analyze endpoint", platform, video_id)
+            return AnalysisResult(**cache_hit)
+
+        db_hit = get_db_hit(db_pool, platform, video_id)
+        if db_hit:
+            logger.info("DB hit for %s:%s in analyze endpoint", platform, video_id)
+            return AnalysisResult(**db_hit)
 
     video_info: Optional[Dict[str, Any]] = None
 
@@ -277,7 +321,7 @@ async def analyze_video_post(payload: AnalyzeRequest, request: Request):
 
 
 @app.get("/api/admin/metrics", response_model=AdminMetricsResponse)
-async def get_admin_metrics():
+async def get_admin_metrics(api_key: str = Depends(verify_admin_api_key)):
     if not db_pool:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
@@ -305,7 +349,7 @@ async def get_admin_metrics():
 
 
 @app.post("/api/admin/labels", response_model=AdminLabelResponse)
-async def upsert_admin_label(payload: AdminLabelRequest):
+async def upsert_admin_label(payload: AdminLabelRequest, api_key: str = Depends(verify_admin_api_key)):
     if not db_pool:
         raise HTTPException(status_code=503, detail="Database unavailable")
 

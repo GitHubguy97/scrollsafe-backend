@@ -27,3 +27,7 @@ api_requests.log
 .local_inference_tester.py
 .inference_tester.py
 .model_tester.py
+
+.api_requests.log
+.security_incidents.log
+.SECURITY_CHANGES.md

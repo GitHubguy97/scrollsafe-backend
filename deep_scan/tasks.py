@@ -656,10 +656,11 @@ def _call_inference(frames: Sequence[bytes]) -> Dict[str, Any]:
     return response.json()
 
 
-def _aggregate_inference(inference: Dict[str, Any]) -> Dict[str, Any]:
+def _aggregate_inference(inference: Dict[str, Any], heuristics_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Aggregate inference results using doomscroller's proven decision logic.
-    Uses sophisticated thresholds and rules instead of simple vote counting.
+    Aggregate inference results with conservative classification.
+    Integrates heuristics (AI keywords in title/description) into decision logic.
+    Skews towards real - only classifies as AI with very strong signals.
     """
     results = inference.get("results") or []
     if not results:
@@ -688,8 +689,8 @@ def _aggregate_inference(inference: Dict[str, Any]) -> Dict[str, Any]:
         "artificial": vote_totals["artificial"] / total_votes,
     }
 
-    # Use doomscroller's decision logic
-    decision = _decide_label(label_scores_list)
+    # Use conservative decision logic with heuristics integration
+    decision = _decide_label(label_scores_list, heuristics_result)
     internal_label = decision["label"]
 
     # Map internal labels to external labels
@@ -697,9 +698,8 @@ def _aggregate_inference(inference: Dict[str, Any]) -> Dict[str, Any]:
         "artificial": "ai-detected",
         "real": "verified",
         "suspicious": "suspicious",
-        "unknown": "unknown",
     }
-    external_label = label_map.get(internal_label, "unknown")
+    external_label = label_map.get(internal_label, "verified")  # Default to verified instead of unknown
     confidence = float(decision.get("confidence", 0.0))
     reason = decision.get("reason", "model_vote")
     features = decision.get("features", {})
@@ -716,16 +716,18 @@ def _aggregate_inference(inference: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _decide_label(scores_list: List[Dict[str, float]]) -> Dict[str, Any]:
+def _decide_label(scores_list: List[Dict[str, float]], heuristics_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Doomscroller's proven classification logic.
+    Conservative classification logic that skews towards real.
+    Only classifies as AI with very strong signals.
+    Integrates heuristics for AI keywords in title/description.
+    Never returns unknown - always picks real, suspicious, or artificial.
 
     Decision rules:
-    1. Too few frames (<4) → unknown
-    2. Strong artificial signal → artificial
-    3. Mixed/suspicious signal → suspicious
-    4. Strong real signal → real
-    5. Default → unknown
+    1. With AI keywords: Lower threshold for AI/suspicious
+    2. Without AI keywords: Very high threshold for AI (default to real)
+    3. Too few frames → default to real
+    4. No unknown label - must classify
     """
     total_frames = len(scores_list)
     artificial_scores = [scores["artificial"] for scores in scores_list]
@@ -753,14 +755,25 @@ def _decide_label(scores_list: List[Dict[str, float]]) -> Dict[str, Any]:
     # Count frames exceeding thresholds
     count_a90 = sum(score >= 0.90 for score in artificial_scores)
     count_a80 = sum(score >= 0.80 for score in artificial_scores)
+    count_a95 = sum(score >= 0.95 for score in artificial_scores)
     frac_a90 = count_a90 / total_frames if total_frames else 0.0
     frac_a80 = count_a80 / total_frames if total_frames else 0.0
+    frac_a95 = count_a95 / total_frames if total_frames else 0.0
 
     majority_label = (
         "artificial"
         if vote_counts["artificial"] >= vote_counts["real"]
         else "real"
     )
+
+    # Check heuristics for AI keywords in title/description
+    has_ai_keywords = False
+    heuristic_label = None
+    if heuristics_result:
+        heuristic_label = heuristics_result.get("result")
+        # If heuristics detected AI, it means AI keywords in title/description
+        if heuristic_label == "ai-detected":
+            has_ai_keywords = True
 
     # Build features object for storage
     features = {
@@ -772,68 +785,88 @@ def _decide_label(scores_list: List[Dict[str, float]]) -> Dict[str, Any]:
         "top3_mean_artificial": top3_mean,
         "count_a90": count_a90,
         "count_a80": count_a80,
+        "count_a95": count_a95,
         "frac_a90": frac_a90,
         "frac_a80": frac_a80,
+        "frac_a95": frac_a95,
+        "has_ai_keywords": has_ai_keywords,
+        "heuristic_label": heuristic_label,
     }
 
-    # Rule 1: Too few frames
+    # Rule 1: Too few frames - default to real (not unknown)
     if total_frames < 4:
         return {
-            "label": "unknown",
-            "confidence": 0.0,
-            "reason": "too_few_frames",
-            "features": features,
-        }
-
-    # Rule 2: Strong artificial signal
-    if (
-        frac_a90 >= 0.5  # >= 50% of frames score artificial >= 0.90
-        or (count_a90 >= 3 and top3_mean >= 0.96)  # 3+ frames at 0.90+, top 3 average >= 0.96
-        or (
-            count_a90 >= 3  # 3+ frames at 0.90+
-            and len(sorted_artificial) >= 3
-            and min(sorted_artificial[:3]) >= 0.94  # lowest of top 3 >= 0.94
-        )
-    ):
-        return {
-            "label": "artificial",
-            "confidence": max_artificial,
-            "reason": "strong_artificial",
-            "features": features,
-        }
-
-    # Rule 3: Suspicious signal
-    if (
-        (1 <= count_a90 <= 3 and top3_mean >= 0.92)  # 1-3 frames at 0.90+, top 3 avg >= 0.92
-        or (0.10 <= frac_a80 <= 0.40 and top3_mean >= 0.88)  # 10-40% of frames >= 0.80, top 3 avg >= 0.88
-    ):
-        return {
-            "label": "suspicious",
-            "confidence": max_artificial,
-            "reason": "mixed_signal",
-            "features": features,
-        }
-
-    # Rule 4: Strong real signal
-    real_votes = vote_counts["real"]
-    if (
-        real_votes >= max(total_frames * 0.6, 8)  # 60% of frames vote "real" OR at least 8 frames
-        and count_a90 <= 1  # 0-1 frames at 0.90+ artificial
-        and max_artificial < 0.90  # max artificial score < 0.90
-        and frac_a80 <= 0.20  # <= 20% of frames >= 0.80 artificial
-    ):
-        return {
             "label": "real",
-            "confidence": max(1.0 - max_artificial, 0.0),
-            "reason": "consistent_real",
+            "confidence": 0.5,
+            "reason": "too_few_frames_default_real",
             "features": features,
         }
 
-    # Rule 5: Default (no clear signal)
+    # Rule 2: Very strong artificial signal (RAISED thresholds - more conservative)
+    if has_ai_keywords:
+        # With AI keywords in title/description, use moderate threshold
+        if (
+            frac_a95 >= 0.35  # 35%+ frames at 0.95+
+            or (count_a90 >= 4 and top3_mean >= 0.94)  # 4+ frames at 0.90+, top3 avg 0.94+
+            or frac_a90 >= 0.5  # 50%+ frames at 0.90+
+        ):
+            return {
+                "label": "artificial",
+                "confidence": max_artificial,
+                "reason": "strong_artificial_with_keywords",
+                "features": features,
+            }
+    else:
+        # NO AI keywords - need VERY strong signal to classify as AI
+        if (
+            frac_a95 >= 0.6  # 60%+ frames at 0.95+ (very high threshold)
+            or (count_a95 >= 6 and top3_mean >= 0.97)  # 6+ frames at 0.95+, top3 avg 0.97+
+            or (
+                frac_a90 >= 0.75  # 75%+ frames at 0.90+ (raised from 0.5)
+                and min(sorted_artificial[:5] if len(sorted_artificial) >= 5 else sorted_artificial) >= 0.93
+            )
+        ):
+            return {
+                "label": "artificial",
+                "confidence": max_artificial,
+                "reason": "very_strong_artificial_no_keywords",
+                "features": features,
+            }
+
+    # Rule 3: Suspicious signals
+    if has_ai_keywords:
+        # With AI keywords, be more suspicious with moderate signals
+        if (
+            count_a90 >= 1  # Any frame at 0.90+
+            or frac_a80 >= 0.20  # 20%+ frames at 0.80
+            or max_artificial >= 0.85  # Any single frame >= 0.85
+        ):
+            return {
+                "label": "suspicious",
+                "confidence": max_artificial,
+                "reason": "ai_keywords_with_signals",
+                "features": features,
+            }
+    else:
+        # Without AI keywords, need stronger signal for suspicious
+        if (
+            (3 <= count_a90 <= 5 and top3_mean >= 0.93)  # 3-5 frames at 0.90+, top3 avg 0.93+
+            or (0.30 <= frac_a90 <= 0.60 and max_artificial >= 0.92)  # 30-60% at 0.90+, max 0.92+
+            or (frac_a80 >= 0.40 and top3_mean >= 0.90)  # 40%+ at 0.80, top3 avg 0.90+
+        ):
+            return {
+                "label": "suspicious",
+                "confidence": max_artificial,
+                "reason": "mixed_signal_no_keywords",
+                "features": features,
+            }
+
+    # Rule 4: Default to real
+    # If we got here and didn't hit artificial or suspicious, it's real
     return {
-        "label": "unknown",
-        "confidence": max(1.0 - max_artificial, max_artificial),
-        "reason": "no_rule_match",
+        "label": "real",
+        "confidence": max(1.0 - max_artificial, 0.6),  # At least 0.6 confidence
+        "reason": "default_real",
         "features": features,
     }
 
@@ -841,6 +874,11 @@ def _decide_label(scores_list: List[Dict[str, float]]) -> Dict[str, Any]:
 def _apply_heuristics(
     aggregate: Dict[str, Any], heuristics_result: Optional[Dict[str, Any]], client_hints: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
+    """
+    Apply heuristics and client hints to aggregate result.
+    Less aggressive than before since heuristics are already integrated into decision logic.
+    Mainly boosts confidence and adds reasoning, only overrides in extreme cases.
+    """
     label = aggregate["label"]
     confidence = float(aggregate["confidence"])
     reasons = [aggregate["reason"]]
@@ -853,12 +891,12 @@ def _apply_heuristics(
         h_reason = heuristics_result.get("reason")
         if h_reason:
             reasons.append(f"metadata:{h_reason}")
-        if h_label == "ai-detected":
-            label = "ai-detected"
+
+        # Less aggressive - only boost confidence and reasons
+        # Labels are already influenced by heuristics in _decide_label
+        if h_label == "ai-detected" and label == "ai-detected":
+            # Both agree it's AI - boost confidence
             confidence = max(confidence, h_conf)
-        elif h_label == "suspicious" and label == "verified":
-            label = "suspicious"
-            confidence = max(confidence, max(h_conf, 0.6))
 
     if client_hints:
         features["client_hints"] = client_hints
@@ -867,6 +905,8 @@ def _apply_heuristics(
         hint_reason = client_hints.get("reason")
         if hint_reason:
             reasons.append(f"client:{hint_reason}")
+
+        # Client hints can still override - user-reported suspicion is important
         if hint_label == "ai-detected":
             label = "ai-detected"
             confidence = max(confidence, hint_conf)
@@ -906,15 +946,22 @@ def process_deep_scan_job(job_id: str, payload: Dict[str, Any]) -> None:
     try:
         _store_job_status(job_id, "running")
 
-        frames = _extract_frames(url, settings.target_frames, timeout=settings.frame_extract_timeout)
-        inference = _call_inference(frames)
-        aggregate = _aggregate_inference(inference)
-
+        # Get video info and heuristics FIRST (before frame extraction)
+        # This allows heuristics to be integrated into the decision logic
         video_info: Optional[Dict[str, Any]] = None
         if platform == "youtube":
             video_info = get_video_info(video_id)
 
         heuristics_result = check_heuristics(video_info) if video_info else None
+
+        # Extract frames and run inference
+        frames = _extract_frames(url, settings.target_frames, timeout=settings.frame_extract_timeout)
+        inference = _call_inference(frames)
+
+        # Aggregate with heuristics integrated into decision logic
+        aggregate = _aggregate_inference(inference, heuristics_result)
+
+        # Apply remaining heuristics and client hints (less aggressive now)
         merged = _apply_heuristics(aggregate, heuristics_result, client_hints)
 
         analyzed_at = datetime.now(timezone.utc)

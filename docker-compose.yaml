@@ -11,7 +11,7 @@ services:
       POSTGRES_PASSWORD: postgres1997!
       POSTGRES_DB: doomscroller
     ports:
-      - "54432:5432"  # Exposed for Instance 2 (doomscroller workers) and pgAdmin
+      - "5432:5432"  # Exposed for Instance 2 (doomscroller workers) and pgAdmin
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql  # Auto-apply schema on first run

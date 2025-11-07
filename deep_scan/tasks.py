@@ -954,9 +954,31 @@ def process_deep_scan_job(job_id: str, payload: Dict[str, Any]) -> None:
 
         heuristics_result = check_heuristics(video_info) if video_info else None
 
-        # Extract frames and run inference
-        frames = _extract_frames(url, settings.target_frames, timeout=settings.frame_extract_timeout)
-        inference = _call_inference(frames)
+        # Call resolver service for frame extraction + inference
+        try:
+            logger.info("Calling resolver service at %s", settings.resolver_url)
+            resolver_response = requests.post(
+                f"{settings.resolver_url}/extract-and-infer",
+                json={
+                    "url": url,
+                    "target_frames": settings.target_frames,
+                    "timeout": settings.frame_extract_timeout
+                },
+                timeout=settings.frame_extract_timeout + 30  # Add buffer for network latency
+            )
+            resolver_response.raise_for_status()
+            resolver_data = resolver_response.json()
+
+            if not resolver_data.get("success"):
+                error_msg = resolver_data.get("error", "Unknown resolver error")
+                raise RuntimeError(f"Resolver failed: {error_msg}")
+
+            inference = resolver_data["inference"]
+            logger.info("Resolver completed successfully, received inference results")
+
+        except requests.exceptions.RequestException as exc:
+            logger.error("Failed to connect to resolver service: %s", exc)
+            raise RuntimeError(f"Resolver service unavailable: {str(exc)}")
 
         # Aggregate with heuristics integrated into decision logic
         aggregate = _aggregate_inference(inference, heuristics_result)
@@ -971,7 +993,7 @@ def process_deep_scan_job(job_id: str, payload: Dict[str, Any]) -> None:
             "reason": merged["reason"],
             "vote_share": aggregate["vote_share"],
             "features": merged["features"],
-            "frames_count": len(frames),
+            "frames_count": len(inference.get("results", [])),
             "batch_time_ms": inference.get("batch_time_ms"),
             "analyzed_at": analyzed_at.isoformat(),
             "model_version": settings.model_version,

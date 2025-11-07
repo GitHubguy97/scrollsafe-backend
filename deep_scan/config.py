@@ -38,6 +38,10 @@ class Settings:
     redis_job_ttl_seconds: int = _int_env("DEEP_SCAN_RESULT_TTL_SECONDS", 900)
     redis_lock_ttl_seconds: int = _int_env("DEEP_SCAN_LOCK_TTL_SECONDS", 300)
     queue_name: str = os.getenv("DEEP_SCAN_QUEUE", "deep_scan")
+
+    # Resolver service URL (tunneled to user's PC for frame extraction)
+    resolver_url: str = os.getenv("DEEPSCAN_RESOLVER_URL")
+
     inference_url: str = "https://chkwk82q35esq5v4.us-east-1.aws.endpoints.huggingface.cloud"
     hf_token: str = os.getenv('HUGGING_FACE_API_KEY')
     # os.getenv('INFER_API_URL', "http://127.0.0.1:8080")

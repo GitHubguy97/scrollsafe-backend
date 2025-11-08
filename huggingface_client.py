@@ -1,6 +1,7 @@
 import requests
 import asyncio
 import io
+import logging
 from typing import Dict
 from video_utils import get_video_info
 from heuristics import check_heuristics
@@ -11,110 +12,59 @@ from PIL import Image
 load_dotenv()
 
 HUGGING_FACE_API_KEY = os.getenv("HUGGING_FACE_API_KEY")
+INFER_API_URL = os.getenv("INFER_API_URL")
+INFER_API_KEY = os.getenv("INFER_API_KEY")
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
 async def analyze_with_huggingface(video_id: str) -> Dict:
     """
     Deep scan: AI thumbnail analysis with heuristics fallback for false negatives
     Uses cropped thumbnail + haywoodsloan model, falls back to heuristics when AI says "verified" but heuristics says "ai-detected"
     """
-    
+
+    logger.info("=== Starting thumbnail analysis for video_id=%s ===", video_id)
+
     # Step 1: Get heuristics result for comparison
-    print(f"Getting heuristics baseline for {video_id}")
+    logger.info("Step 1: Fetching video metadata for heuristics")
     video_info = get_video_info(video_id)
     heuristics_result = None
     if video_info:
         heuristics_result = check_heuristics(video_info)
-        print(f"Heuristics result: {heuristics_result['result']} ({heuristics_result['confidence']:.2f})")
+        logger.info("Heuristics result: %s (confidence: %.2f) - %s",
+                   heuristics_result['result'],
+                   heuristics_result['confidence'],
+                   heuristics_result['reason'])
+    else:
+        logger.warning("No video metadata found for %s", video_id)
     
     # Step 2: Try AI thumbnail analysis
     ai_result = None
     if HUGGING_FACE_API_KEY:
         try:
-            print(f"Attempting AI thumbnail analysis for {video_id}")
+            logger.info("Step 2: Attempting AI thumbnail analysis")
             ai_result = await analyze_thumbnail_with_ai(video_id)
             if ai_result:
-                print(f"AI analysis successful: {ai_result['result']} ({ai_result['confidence']:.2f})")
-                
-                # Smart decision logic based on heuristics baseline
-                if heuristics_result:
-                    heuristics_result_type = heuristics_result["result"]
-                    ai_result_type = ai_result["result"]
-                    
-                    # Check if heuristics found explicit AI mentions (high confidence patterns)
-                    has_explicit_ai_mention = (
-                        heuristics_result_type == "ai-detected" and 
-                        heuristics_result["confidence"] >= 0.80
-                    )
-                    
-                    # Case 1: No explicit AI mention in metadata - heavily favor heuristics
-                    if not has_explicit_ai_mention:
-                        print(f"No explicit AI mention in metadata - heavily favoring heuristics")
-                        if heuristics_result_type == "verified":
-                            # Heuristics says verified + no AI mention = definitely verified
-                            print(f"Heuristics says verified + no AI mention = trusting heuristics")
-                            return {
-                                "result": "verified",
-                                "confidence": min(heuristics_result["confidence"] + 0.1, 0.95),
-                                "reason": f"Heuristics indicates authentic content (no AI metadata found)"
-                            }
-                        elif heuristics_result_type == "suspicious":
-                            # Heuristics says suspicious + no AI mention = likely verified
-                            print(f"Heuristics says suspicious + no AI mention = trusting heuristics (verified)")
-                            return {
-                                "result": "verified",
-                                "confidence": 0.75,
-                                "reason": f"Heuristics suggests authentic content despite minor concerns (no AI metadata)"
-                            }
-                        else:
-                            # Heuristics says unknown + no AI mention = verified
-                            print(f"Heuristics says unknown + no AI mention = marking as verified")
-                            return {
-                                "result": "verified",
-                                "confidence": 0.80,
-                                "reason": f"No AI indicators found in metadata or heuristics"
-                            }
-                    
-                    # Case 2: Explicit AI mention found - balance heuristics and AI
-                    else:
-                        print(f"Explicit AI mention found - balancing heuristics and AI")
-                        if heuristics_result_type == "ai-detected":
-                            if ai_result_type == "ai-detected":
-                                # Both agree it's AI - combine confidence
-                                combined_confidence = min((heuristics_result["confidence"] + ai_result["confidence"]) / 2 + 0.1, 0.98)
-                                print(f"Both heuristics and AI say ai-detected - combining confidence")
-                                return {
-                                    "result": "ai-detected",
-                                    "confidence": combined_confidence,
-                                    "reason": f"Double confirmation: {heuristics_result['reason']}"
-                                }
-                            else:
-                                # AI says verified but heuristics says ai-detected - trust heuristics
-                                print(f"AI says verified but heuristics says ai-detected - trusting heuristics")
-                                return {
-                                    "result": "ai-detected",
-                                    "confidence": min(heuristics_result["confidence"] + 0.1, 0.95),
-                                    "reason": f"Heuristics override: {heuristics_result['reason']}"
-                                }
-                        elif heuristics_result_type == "suspicious":
-                            if ai_result_type == "ai-detected":
-                                # AI confirms suspicious -> AI detected
-                                print(f"AI confirms suspicious heuristics - marking as ai-detected")
-                                return {
-                                    "result": "ai-detected",
-                                    "confidence": min(ai_result["confidence"] + 0.05, 0.95),
-                                    "reason": f"AI confirmed suspicious indicators: {ai_result['reason']}"
-                                }
-                            else:
-                                # AI says verified despite suspicious heuristics - trust AI
-                                print(f"AI says verified despite suspicious heuristics - trusting AI")
-                                return ai_result
-                
-                # No heuristics baseline - trust AI result
+                logger.info("AI model result: %s (confidence: %.2f) - %s",
+                           ai_result['result'],
+                           ai_result['confidence'],
+                           ai_result['reason'])
+
+                # For thumbnail fallback, trust the AI model's classification directly
+                # The model already maps scores properly:
+                # - artificial >= 0.8 -> ai-detected
+                # - artificial >= 0.6 -> suspicious
+                # - high real score -> verified
+                logger.info("=== Returning AI model result: %s ===", ai_result)
                 return ai_result
         except Exception as e:
-            print(f"AI analysis failed, falling back to heuristics: {e}")
+            logger.error("AI analysis failed: %s", e, exc_info=True)
+            logger.info("Falling back to heuristics-only analysis")
     else:
-        print(f"No Hugging Face API key, using heuristics only")
+        logger.warning("No Hugging Face API key configured, using heuristics only")
     
     # Step 3: Fallback to heuristics-based analysis
     print(f"Using heuristics-based analysis for {video_id}")
@@ -169,69 +119,69 @@ async def analyze_thumbnail_with_ai(video_id: str) -> Dict:
     
     try:
         # Download thumbnail bytes
+        logger.info("Downloading thumbnail for video_id=%s", video_id)
         raw_bytes = _download_thumbnail_bytes(video_id)
         if not raw_bytes:
             raise RuntimeError("Could not download thumbnail")
-        
+
         # Load and crop image
+        logger.info("Processing thumbnail: cropping to 9:16")
         img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
         w, h = img.size
         l, t, r, b = _compute_center_crop_box(w, h, margin=0.02)
         cropped = img.crop((l, t, r, b))
-        
-        print(f"Cropped thumbnail: {w}x{h} -> {cropped.size} (box={[l,t,r,b]})")
-        
+
+        logger.info("✓ Cropped thumbnail: %dx%d -> %s (box=[%d,%d,%d,%d])",
+                   w, h, cropped.size, l, t, r, b)
+
         # Convert to JPEG bytes
         buf = io.BytesIO()
         cropped.save(buf, format="JPEG", quality=90)
         img_bytes = buf.getvalue()
-        
-        # Call haywoodsloan model
-        result = _classify_haywood_bytes(img_bytes)
-        
-        print(f"Haywood Response: {result}")
-        
-        # Parse result - find artificial vs real scores
-        artificial_score = 0.0
-        real_score = 0.0
-        
-        for item in result:
-            label = str(item.get("label", "")).lower()
-            score = float(item.get("score", 0.0))
-            if "artificial" in label:
-                artificial_score = score
-            elif "real" in label:
-                real_score = score
-        
+
+        # Call custom inference endpoint
+        logger.info("Calling custom HuggingFace inference endpoint...")
+        label_scores = _classify_haywood_bytes(img_bytes)
+
+        logger.info("✓ Model response received: %s", label_scores)
+
+        # Extract scores from dict: {"real": 0.9, "artificial": 0.1}
+        artificial_score = float(label_scores.get("artificial", 0.0))
+        real_score = float(label_scores.get("real", 0.0))
+
         confidence = max(artificial_score, real_score)
         is_ai = artificial_score >= real_score
-        
-        print(f"AI analysis complete: artificial={artificial_score:.3f}, real={real_score:.3f}")
-        
+
+        logger.info("Model scores - artificial: %.3f, real: %.3f", artificial_score, real_score)
+
         # Return classification based on AI score
         if is_ai and artificial_score >= 0.8:
-            return {
+            result = {
                 "result": "ai-detected",
                 "confidence": artificial_score,
                 "reason": f"AI detector (cropped) classified as artificial (confidence: {artificial_score:.0%})"
             }
+            logger.info("Model classification: ai-detected (%.0f%%)", artificial_score * 100)
+            return result
         elif is_ai and artificial_score >= 0.6:
-            return {
-                "result": "suspicious", 
+            result = {
+                "result": "suspicious",
                 "confidence": artificial_score,
                 "reason": f"AI detector (cropped) flagged potential synthetic content (confidence: {artificial_score:.0%})"
             }
+            logger.info("Model classification: suspicious (%.0f%%)", artificial_score * 100)
+            return result
         else:
-            return {
+            result = {
                 "result": "verified",
                 "confidence": real_score,
                 "reason": f"AI detector (cropped) indicates authentic content (confidence: {real_score:.0%})"
             }
+            logger.info("Model classification: verified (%.0f%%)", real_score * 100)
+            return result
             
     except Exception as e:
-        import traceback
-        print(f"AI analysis exception: {type(e).__name__}: {str(e)}")
-        print(f"Full traceback: {traceback.format_exc()}")
+        logger.error("✗ Thumbnail AI analysis failed: %s", e, exc_info=True)
         return None
 
 
@@ -240,11 +190,14 @@ def _download_thumbnail_bytes(video_id: str) -> bytes:
     for path in ["maxresdefault.jpg", "hqdefault.jpg"]:
         url = f"https://i.ytimg.com/vi/{video_id}/{path}"
         try:
+            logger.debug("Attempting to download thumbnail: %s", url)
             r = requests.get(url, timeout=10)
             if r.status_code == 200 and r.content:
+                logger.info("✓ Thumbnail downloaded: %s (%d bytes)", path, len(r.content))
                 return r.content
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to download %s: %s", path, e)
+    logger.error("✗ Failed to download any thumbnail for video_id=%s", video_id)
     return None
 
 
@@ -268,25 +221,31 @@ def _compute_center_crop_box(width: int, height: int, margin: float = 0.02) -> t
 
 
 def _classify_haywood_bytes(image_bytes: bytes):
-    """Call haywoodsloan/ai-image-detector-dev-deploy via raw POST."""
-    url = "https://api-inference.huggingface.co/models/haywoodsloan/ai-image-detector-dev-deploy"
+    """Call custom HuggingFace inference endpoint via multipart form data."""
+    # Ensure URL has /v1/infer path
+    url = INFER_API_URL
+    if not url.endswith("/v1/infer"):
+        url = url.rstrip("/") + "/v1/infer"
+
     headers = {
         "Authorization": f"Bearer {HUGGING_FACE_API_KEY}",
-        "Content-Type": "image/jpeg",
+        "X-API-Key": INFER_API_KEY,
     }
-    resp = requests.post(url, headers=headers, data=image_bytes, timeout=30)
+
+    # Send as multipart form data with 'files' field
+    files = [("files", ("image.jpg", image_bytes, "image/jpeg"))]
+
+    resp = requests.post(url, headers=headers, files=files, timeout=30)
     resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, dict) and "error" in data:
-        raise RuntimeError(data["error"]) 
-    # Normalize elements to dicts if needed
-    normalized = []
-    for item in data:
-        label = item.get("label") if isinstance(item, dict) else getattr(item, "label", None)
-        score = item.get("score") if isinstance(item, dict) else getattr(item, "score", None)
-        if label is not None and score is not None:
-            normalized.append({"label": str(label), "score": float(score)})
-    return normalized
+    result = resp.json()
+
+    # Custom endpoint returns: {"results": [{"label_scores": {"real": 0.9, "artificial": 0.1}}]}
+    if "results" in result and len(result["results"]) > 0:
+        label_scores = result["results"][0].get("label_scores", {})
+        return label_scores
+
+    # Fallback to standard format if different response
+    return {entry["label"]: float(entry["score"]) for entry in result}
 
 
 # Legacy function - kept for compatibility but not used in new implementation

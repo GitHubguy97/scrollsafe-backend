@@ -7,6 +7,7 @@ from typing import Optional, Dict, Any, List
 import time
 import os
 import logging
+import requests
 from datetime import datetime, timezone
 from uuid import uuid4
 from dotenv import load_dotenv
@@ -24,6 +25,7 @@ from services.deep_scan_service import deep_job_key, write_job_state, fetch_job_
 
 from deep_scan.config import settings as deep_scan_settings
 from deep_scan.tasks import process_deep_scan_job
+from huggingface_client import analyze_with_huggingface
 
 # Load environment variables
 load_dotenv()
@@ -377,6 +379,20 @@ async def upsert_admin_label(payload: AdminLabelRequest, api_key: str = Depends(
     return AdminLabelResponse(**result)
 
 
+def _check_resolver_health(resolver_url: str, timeout: int = 3) -> bool:
+    """Check if the resolver service is available by hitting its health endpoint."""
+    if not resolver_url:
+        return False
+
+    try:
+        health_url = f"{resolver_url.rstrip('/')}/health"
+        response = requests.get(health_url, timeout=timeout)
+        return response.status_code == 200
+    except Exception as exc:
+        logger.warning("Resolver health check failed: %s", exc)
+        return False
+
+
 @app.post("/api/deep-scan", response_model=DeepScanJobResponse)
 async def enqueue_deep_scan(payload: DeepScanJobRequest):
     print(payload.video_id)
@@ -385,43 +401,120 @@ async def enqueue_deep_scan(payload: DeepScanJobRequest):
 
     job_id = uuid4().hex
     created_at = datetime.now(timezone.utc).isoformat()
-    write_job_state(
-        redis_client,
-        job_id,
-        {
-            "status": "queued",
-            "created_at": created_at,
-            "updated_at": created_at,
-        },
-        deep_scan_settings.redis_job_ttl_seconds,
-    )
 
-    job_payload: Dict[str, Any] = {
-        "platform": payload.platform,
-        "video_id": payload.video_id,
-        "url": payload.url,
-    }
-    if payload.heuristics:
-        job_payload["client_hints"] = payload.heuristics
+    # Check if resolver is available
+    resolver_available = _check_resolver_health(deep_scan_settings.resolver_url)
 
-    try:
-        process_deep_scan_job.apply_async(
-            args=[job_id, job_payload],
-            queue=deep_scan_settings.queue_name,
+    if resolver_available:
+        # Resolver is online - use the full pipeline with frame extraction
+        logger.info("Resolver available, using full frame extraction pipeline")
+        write_job_state(
+            redis_client,
+            job_id,
+            {
+                "status": "queued",
+                "created_at": created_at,
+                "updated_at": created_at,
+            },
+            deep_scan_settings.redis_job_ttl_seconds,
         )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.exception("Failed to enqueue deep scan job %s", job_id)
-        redis_client.delete(deep_job_key(job_id))
-        raise HTTPException(status_code=500, detail="Failed to enqueue job") from exc
 
-    logger.info(
-        "Deep scan job enqueued job_id=%s platform=%s video_id=%s, url=%s",
-        job_id,
-        payload.platform,
-        payload.video_id,
-        payload.url
-    )
-    return {"job_id": job_id, "status": "queued"}
+        job_payload: Dict[str, Any] = {
+            "platform": payload.platform,
+            "video_id": payload.video_id,
+            "url": payload.url,
+        }
+        if payload.heuristics:
+            job_payload["client_hints"] = payload.heuristics
+
+        try:
+            process_deep_scan_job.apply_async(
+                args=[job_id, job_payload],
+                queue=deep_scan_settings.queue_name,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("Failed to enqueue deep scan job %s", job_id)
+            redis_client.delete(deep_job_key(job_id))
+            raise HTTPException(status_code=500, detail="Failed to enqueue job") from exc
+
+        logger.info(
+            "Deep scan job enqueued job_id=%s platform=%s video_id=%s, url=%s",
+            job_id,
+            payload.platform,
+            payload.video_id,
+            payload.url
+        )
+        return {"job_id": job_id, "status": "queued"}
+
+    else:
+        # Resolver is offline - fall back to thumbnail analysis
+        logger.warning("Resolver unavailable, falling back to thumbnail analysis")
+        write_job_state(
+            redis_client,
+            job_id,
+            {
+                "status": "running",
+                "created_at": created_at,
+                "updated_at": created_at,
+            },
+            deep_scan_settings.redis_job_ttl_seconds,
+        )
+
+        try:
+            # Run thumbnail analysis in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                executor,
+                lambda: asyncio.run(analyze_with_huggingface(payload.video_id))
+            )
+
+            # Store result
+            analyzed_at = datetime.now(timezone.utc).isoformat()
+            final_result = {
+                "label": result["result"],
+                "confidence": result["confidence"],
+                "reason": result["reason"] + " (thumbnail fallback - resolver offline)",
+                "vote_share": None,
+                "analyzed_at": analyzed_at,
+                "model_version": "thumbnail_fallback",
+            }
+
+            write_job_state(
+                redis_client,
+                job_id,
+                {
+                    "status": "done",
+                    "result": final_result,
+                    "created_at": created_at,
+                    "updated_at": analyzed_at,
+                },
+                deep_scan_settings.redis_job_ttl_seconds,
+            )
+
+            logger.info(
+                "Deep scan (thumbnail fallback) completed job_id=%s platform=%s video_id=%s result=%s",
+                job_id,
+                payload.platform,
+                payload.video_id,
+                result["result"]
+            )
+
+            return {"job_id": job_id, "status": "done"}
+
+        except Exception as exc:
+            logger.exception("Thumbnail fallback failed for job %s", job_id)
+            write_job_state(
+                redis_client,
+                job_id,
+                {
+                    "status": "failed",
+                    "error": f"Thumbnail analysis failed: {str(exc)}",
+                    "created_at": created_at,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                deep_scan_settings.redis_job_ttl_seconds,
+            )
+            raise HTTPException(status_code=500, detail="Deep scan failed") from exc
 
 
 @app.get("/api/deep-scan/{job_id}", response_model=DeepScanPollResponse)

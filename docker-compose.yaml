@@ -1,0 +1,106 @@
+# ScrollSafe Backend + Databases (Instance 1)
+# This instance runs 24/7 to serve frontend users
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: scrollsafe-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres1997!
+      POSTGRES_DB: doomscroller
+    ports:
+      - "5432:5432"  # Exposed for Instance 2 (doomscroller workers) and pgAdmin
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql  # Auto-apply schema on first run
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d doomscroller"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+  redis:
+    image: redis:7
+    container_name: scrollsafe-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "postgres1997!", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"  # Exposed for Instance 2 (doomscroller workers)
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--pass", "postgres1997!", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: scrollsafe-backend:latest
+    container_name: scrollsafe-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"  # API exposed to internet
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Deep scan worker for on-demand video analysis (triggered by frontend)
+  deep-scan-worker:
+    image: scrollsafe-backend:latest
+    container_name: scrollsafe-deep-scan-worker
+    command: celery -A deep_scan.celery_app worker -Q deep_scan -l info --concurrency=2
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      backend:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    volumes:
+      - /tmp:/tmp  # For temp video files
+
+volumes:
+  pgdata:
+    driver: local
+  redisdata:
+    driver: local

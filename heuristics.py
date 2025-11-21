@@ -1,29 +1,52 @@
 import re
-from typing import Dict, Optional
+from typing import Dict
 from timing_logger import log_timing
+
 
 @log_timing()
 def check_heuristics(video_info: Dict) -> Dict:
     """Check video metadata for suspicious patterns"""
-    
+
     if not video_info:
         return {
             "result": "unknown",
             "confidence": 0.0,
             "reason": "Could not fetch video metadata"
         }
-    
+
+    # Normalize metadata inputs
+    raw_tags = video_info.get('tags', [])
+    if isinstance(raw_tags, str):
+        raw_tags = [raw_tags]
+    normalized_tags = []
+    for tag in raw_tags:
+        if not isinstance(tag, str):
+            continue
+        normalized = tag.strip().lower()
+        if not normalized:
+            continue
+        if not normalized.startswith('#'):
+            normalized = f"#{normalized}"
+        normalized_tags.append(normalized)
+
+    channel = (
+        video_info.get('channelTitle') or
+        video_info.get('channel') or
+        ""
+    )
+
     # Combine text to check
     text_to_check = (
-        video_info.get('title', '') + ' ' + 
+        video_info.get('title', '') + ' ' +
         video_info.get('description', '') + ' ' +
-        ' '.join(video_info.get('tags', []))
+        ' '.join(normalized_tags) + ' ' +
+        channel
     ).lower()
     
     # High confidence AI patterns - definitive AI detection
     high_confidence_patterns = [
         # Explicit AI generation/creation phrases
-        (r'\bai[-\s](generated|created|animated|produced|made|powered|content|video|baby|animation)', 
+        (r'\bai[-\s](generated|created|animated|produced|made|powered|content|video|baby|animation)',
          0.92, "Explicitly labeled as AI-generated"),
         
         # Common AI tools
@@ -49,9 +72,29 @@ def check_heuristics(video_info: Dict) -> Dict:
         # Synthetic content
         (r'\bsynthetic\b', 0.78, "Synthetic content mentioned"),
     ]
-    
+
+    # General AI metadata indicators (hashtags, casual mentions, etc.)
+    ai_metadata_patterns = [
+        (r'#ai[\w-]*', 0.88, "AI hashtag present in metadata"),
+        (r'@[\w_-]*ai[\w_-]*', 0.86, "Channel or handle references AI"),
+        (r'\bai[-\s]*(content|video|short|art|music|story|clip|model|filter|generator|effect)\b',
+         0.88, "AI keywords describing the content"),
+        (r'\bai\b', 0.85, "AI mentioned in metadata"),
+    ]
+
     # Check high confidence patterns first
     for pattern, confidence, reason in high_confidence_patterns:
+        match = re.search(pattern, text_to_check, re.IGNORECASE)
+        if match:
+            matched_text = match.group(0)
+            return {
+                "result": "ai-detected",
+                "confidence": confidence,
+                "reason": f"{reason}: '{matched_text}'"
+            }
+
+    # If any AI metadata mention exists, count it as AI-detected with strong confidence
+    for pattern, confidence, reason in ai_metadata_patterns:
         match = re.search(pattern, text_to_check, re.IGNORECASE)
         if match:
             matched_text = match.group(0)
@@ -63,14 +106,8 @@ def check_heuristics(video_info: Dict) -> Dict:
     
     # Medium confidence patterns - suspicious but not definitive
     medium_confidence_patterns = [
-        # General AI-related hashtags
-        (r'#ai\w*', 0.68, "AI-related hashtag found"),
-        
-        # Standalone "AI" word (less aggressive now)
-        (r'\bai\b', 0.60, "AI mentioned in content"),
-        
         # Common AI-related terms
-        (r'\b(neural|machine\s*learning)\b', 
+        (r'\b(neural|machine\s*learning)\b',
          0.55, "AI-related technical terms"),
     ]
     

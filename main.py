@@ -21,6 +21,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import base64
 import binascii
+import json
+import shutil
 
 from services.analysis_service import get_cache_hit, get_db_hit
 from services.admin_service import build_admin_metrics, upsert_admin_label as admin_upsert_label
@@ -38,32 +40,35 @@ REDIS_URL = os.getenv("REDIS_APP_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 BROKER_URL = os.getenv("CELERY_BROKER_URL")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")  # Required for admin routes
-PROJECT_ROOT = Path(r"C:\Users\gideo\Documents\Hackathon-project")
+PROJECT_ROOT = Path(__file__).resolve().parent
 OUT_DIR = PROJECT_ROOT / "out"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-local_deep_scan_jobs: Dict[str, Dict[str, Any]] = {}
+DEEP_SCAN_STORAGE_DIR = (OUT_DIR / "deep_scans")
+DEEP_SCAN_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Temporarily disable Redis/Postgres connectivity for local development.
-# Original connection logic is preserved below for easy restoration.
 redis_client: Optional[redis.Redis] = None
-# if REDIS_URL:
-#     redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+if REDIS_URL:
+    try:
+        redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    except Exception as exc:
+        print("Failed to initialize Redis client:", exc)
+        redis_client = None
 
 broker_redis: Optional[redis.Redis] = None
-# if BROKER_URL and BROKER_URL.startswith(("redis://", "rediss://")):
-#     try:
-#         broker_redis = redis.Redis.from_url(BROKER_URL, decode_responses=True)
-#     except Exception:
-#         broker_redis = None
+if BROKER_URL and BROKER_URL.startswith(("redis://", "rediss://")):
+    try:
+        broker_redis = redis.Redis.from_url(BROKER_URL, decode_responses=True)
+    except Exception:
+        broker_redis = None
 
 db_pool: Optional[ConnectionPool] = None
-# if DATABASE_URL:
-#     db_pool = ConnectionPool(
-#         conninfo=DATABASE_URL,
-#         min_size=int(os.getenv("DB_POOL_MIN_SIZE", "1")),
-#         max_size=int(os.getenv("DB_POOL_MAX_SIZE", "10")),
-#         timeout=float(os.getenv("DB_POOL_TIMEOUT", "30")),
-#     )
+if DATABASE_URL:
+    db_pool = ConnectionPool(
+        conninfo=DATABASE_URL,
+        min_size=int(os.getenv("DB_POOL_MIN_SIZE", "1")),
+        max_size=int(os.getenv("DB_POOL_MAX_SIZE", "10")),
+        timeout=float(os.getenv("DB_POOL_TIMEOUT", "30")),
+    )
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -405,51 +410,63 @@ def _check_resolver_health(resolver_url: str, timeout: int = 3) -> bool:
 
 @app.post("/api/deep-scan", response_model=DeepScanJobResponse)
 async def enqueue_deep_scan(payload: DeepScanJobRequest):
-    """Temporary deep scan stub that simply stores uploaded frames locally."""
+    """Store uploaded frames and enqueue a Celery job to run inference."""
     frames = payload.frames or []
     if not frames:
         raise HTTPException(status_code=400, detail="No frames provided for deep scan")
 
-    job_id = f"local-{uuid4().hex}"
-    saved_files: List[str] = []
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Deep scan requires Redis connectivity")
 
-    for index, frame_data in enumerate(frames):
-        try:
-            binary = decode_data_url(frame_data)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid frame at index {index}: {exc}",
-            ) from exc
+    job_id = f"deep-{uuid4().hex}"
+    try:
+        frame_dir, saved_files = persist_client_frames(job_id, payload.video_id, frames)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        safe_video_id = (payload.video_id or "video").replace("/", "_")
-        filename = OUT_DIR / f"{safe_video_id}_frame_{index + 1:03d}.jpg"
-        with open(filename, "wb") as handle:
-            handle.write(binary)
-        saved_files.append(str(filename))
-
-    analyzed_at = datetime.now(timezone.utc).isoformat()
-    local_deep_scan_jobs[job_id] = {
-        "status": "done",
-        "updated_at": analyzed_at,
-        "result": {
-            "result": "uploaded",
-            "confidence": 0.0,
-            "reason": f"Saved {len(saved_files)} frames locally",
-            "vote_share": None,
-            "analyzed_at": analyzed_at,
-            "model_version": "client_capture_stub",
-        },
+    manifest = {
+        "job_id": job_id,
+        "platform": (payload.platform or DEFAULT_PLATFORM).lower(),
+        "video_id": payload.video_id,
+        "url": payload.url,
+        "frame_dir": str(frame_dir),
+        "frames": [Path(path).name for path in saved_files],
+        "metadata": payload.heuristics or {},
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    with open(frame_dir / "manifest.json", "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
 
-    logger.info(
-        "Stored %s frames for video %s at %s",
-        len(saved_files),
-        payload.video_id,
-        OUT_DIR,
+    write_job_state(
+        redis_client,
+        job_id,
+        {"status": "queued", "updated_at": datetime.now(timezone.utc).isoformat()},
+        deep_scan_settings.redis_job_ttl_seconds,
     )
 
-    return {"job_id": job_id, "status": "done"}
+    job_payload = {
+        "platform": manifest["platform"],
+        "video_id": payload.video_id,
+        "url": payload.url,
+        "frame_dir": str(frame_dir),
+        "frame_count": len(saved_files),
+        "metadata": payload.heuristics or {},
+    }
+
+    try:
+        process_deep_scan_job.delay(job_id, job_payload)
+    except Exception as exc:
+        logger.exception("Failed to enqueue deep scan job")
+        raise HTTPException(status_code=500, detail="Failed to enqueue deep scan") from exc
+
+    logger.info(
+        "Enqueued deep scan job %s with %s frames for %s",
+        job_id,
+        len(saved_files),
+        payload.video_id,
+    )
+
+    return {"job_id": job_id, "status": "queued"}
 
 
 @app.get("/api/deep-scan/{job_id}", response_model=DeepScanPollResponse)
@@ -484,17 +501,7 @@ async def poll_deep_scan(job_id: str):
 
         return response
 
-    # Local stub fallback
-    payload = local_deep_scan_jobs.get(job_id)
-    if not payload:
-        raise HTTPException(status_code=404, detail="Job not found")
-    response: Dict[str, Any] = {
-        "status": payload.get("status", "done"),
-        "updated_at": payload.get("updated_at"),
-    }
-    if payload.get("result"):
-        response["result"] = payload["result"]
-    return response
+    raise HTTPException(status_code=503, detail="Deep scan storage unavailable")
 
 
 def decode_data_url(data_url: str) -> bytes:
@@ -513,6 +520,26 @@ def decode_data_url(data_url: str) -> bytes:
         return base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ValueError("invalid base64 data") from exc
+
+
+def persist_client_frames(job_id: str, video_id: Optional[str], frames: List[str]) -> tuple[Path, List[str]]:
+    job_dir = DEEP_SCAN_STORAGE_DIR / job_id
+    if job_dir.exists():
+        shutil.rmtree(job_dir, ignore_errors=True)
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_files: List[str] = []
+    for index, frame_data in enumerate(frames):
+        try:
+            binary = decode_data_url(frame_data)
+        except ValueError as exc:
+            raise ValueError(f"Invalid frame at index {index}: {exc}") from exc
+        filename = job_dir / f"frame_{index + 1:03d}.jpg"
+        with open(filename, "wb") as handle:
+            handle.write(binary)
+        saved_files.append(str(filename))
+
+    return job_dir, saved_files
 
 
 @asynccontextmanager

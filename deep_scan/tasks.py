@@ -62,6 +62,33 @@ def _store_job_status(job_id: str, status: str, *, result: Optional[Dict[str, An
     client.set(_job_key(job_id), json.dumps(payload), ex=settings.redis_job_ttl_seconds)
 
 
+def _build_metadata_for_heuristics(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    if not metadata:
+        return {}
+
+    tags = metadata.get("hashtags") or metadata.get("tags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+
+    return {
+        "title": metadata.get("title") or metadata.get("channel") or "",
+        "description": metadata.get("description") or metadata.get("caption") or "",
+        "tags": tags,
+    }
+
+
+def _load_saved_frames(frame_dir: str) -> List[bytes]:
+    path = Path(frame_dir)
+    if not path.exists():
+        raise RuntimeError(f"Frame directory not found: {frame_dir}")
+
+    frame_files = sorted(path.glob("frame_*.jpg"))
+    if not frame_files:
+        raise RuntimeError(f"No frames found in {frame_dir}")
+
+    return [file.read_bytes() for file in frame_files]
+
+
 # ==============================================================================
 # ROBUST FRAME EXTRACTION PIPELINE
 # ==============================================================================
@@ -633,18 +660,17 @@ def _call_inference(frames: Sequence[bytes]) -> Dict[str, Any]:
         for idx, blob in enumerate(frames)
     ]
 
+    headers: Dict[str, str] = {}
+    if settings.hf_token:
+        headers["Authorization"] = f"Bearer {settings.hf_token}"
     if settings.inference_api_key:
-        # Support both Hugging Face Bearer and custom header usage
-        headers = {
-        "Authorization": f"Bearer {settings.hf_token}",
-        "X-API-Key": settings.inference_api_key,
-    }
-        
+        headers["X-API-Key"] = settings.inference_api_key
+    if "Authorization" not in headers:
+        raise RuntimeError("HUGGING_FACE_API_KEY is required for inference")
+
     # Debug logging
     logger.info("Inference URL: %s", endpoint)
-    logger.info("API Key present: %s", bool(settings.inference_api_key))
-    logger.info("API Key (first 10 chars): %s", settings.inference_api_key[:10] if settings.inference_api_key else "None")
-    logger.info("Headers: %s", {k: v[:20] + "..." if len(v) > 20 else v for k, v in headers.items()})
+    logger.info("API key present: %s", bool(settings.inference_api_key))
 
     response = requests.post(
         endpoint,
@@ -946,39 +972,32 @@ def process_deep_scan_job(job_id: str, payload: Dict[str, Any]) -> None:
     try:
         _store_job_status(job_id, "running")
 
-        # Get video info and heuristics FIRST (before frame extraction)
-        # This allows heuristics to be integrated into the decision logic
-        video_info: Optional[Dict[str, Any]] = None
-        if platform == "youtube":
+        metadata = payload.get("metadata") or {}
+
+        # Fetch video metadata for heuristics (YouTube) or fall back to client-provided metadata
+        heuristics_source: Optional[Dict[str, Any]] = None
+        if platform == "youtube" and video_id:
             video_info = get_video_info(video_id)
+            heuristics_source = video_info or None
+        if not heuristics_source and metadata:
+            heuristics_source = _build_metadata_for_heuristics(metadata)
 
-        heuristics_result = check_heuristics(video_info) if video_info else None
+        heuristics_result = check_heuristics(heuristics_source) if heuristics_source else None
 
-        # Call resolver service for frame extraction + inference
-        try:
-            logger.info("Calling resolver service at %s", settings.resolver_url)
-            resolver_response = requests.post(
-                f"{settings.resolver_url}/extract-and-infer",
-                json={
-                    "url": url,
-                    "target_frames": settings.target_frames,
-                    "timeout": settings.frame_extract_timeout
-                },
-                timeout=settings.frame_extract_timeout + 30  # Add buffer for network latency
-            )
-            resolver_response.raise_for_status()
-            resolver_data = resolver_response.json()
+        frame_dir = payload.get("frame_dir")
+        if not frame_dir:
+            raise RuntimeError("Frame directory not provided in job payload")
 
-            if not resolver_data.get("success"):
-                error_msg = resolver_data.get("error", "Unknown resolver error")
-                raise RuntimeError(f"Resolver failed: {error_msg}")
-
-            inference = resolver_data["inference"]
-            logger.info("Resolver completed successfully, received inference results")
-
-        except requests.exceptions.RequestException as exc:
-            logger.error("Failed to connect to resolver service: %s", exc)
-            raise RuntimeError(f"Resolver service unavailable: {str(exc)}")
+        frames = _load_saved_frames(frame_dir)
+        inference_start = time.perf_counter()
+        inference = _call_inference(frames)
+        inference_duration = (time.perf_counter() - inference_start) * 1000
+        logger.info(
+            "Inference completed for job %s with %d frames in %.1f ms",
+            job_id,
+            len(frames),
+            inference_duration,
+        )
 
         # Aggregate with heuristics integrated into decision logic
         aggregate = _aggregate_inference(inference, heuristics_result)

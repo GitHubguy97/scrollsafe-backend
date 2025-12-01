@@ -39,23 +39,24 @@ class Settings:
     redis_lock_ttl_seconds: int = _int_env("DEEP_SCAN_LOCK_TTL_SECONDS", 300)
     queue_name: str = os.getenv("DEEP_SCAN_QUEUE", "deep_scan")
 
-    # Resolver service URL (tunneled to user's PC for frame extraction)
-    resolver_url: str = os.getenv("DEEPSCAN_RESOLVER_URL")
+    # Optional legacy resolver URL (unused when frames come from extension)
+    resolver_url: str = os.getenv("DEEPSCAN_RESOLVER_URL", "")
 
-    inference_url: str = "https://chkwk82q35esq5v4.us-east-1.aws.endpoints.huggingface.cloud"
-    hf_token: str = os.getenv('HUGGING_FACE_API_KEY')
-    # os.getenv('INFER_API_URL', "http://127.0.0.1:8080")
-    # os.getenv(
-    #     "DEEP_SCAN_INFER_URL",
-    #     os.getenv("LOCAL_INFER_API_URL", os.getenv("INFER_API_URL", "http://127.0.0.1:8080")),
-    # )
-    inference_api_key: str = "380efcff27965210532f15a4140a41ac4189f2edb931052cec66a3923ba353d4"
-    # None = os.getenv("DEEP_SCAN_INFER_API_KEY", os.getenv("INFER_API_KEY"))
+    inference_url: str = os.getenv(
+        "INFER_API_URL",
+        "https://chkwk82q35esq5v4.us-east-1.aws.endpoints.huggingface.cloud",
+    )
+    hf_token: str = os.getenv("HUGGING_FACE_API_KEY", "")
+    inference_api_key: str = os.getenv("INFER_API_KEY", "")
     target_frames: int = _int_env("DEEP_SCAN_TARGET_FRAMES", _int_env("INFER_TARGET_FRAMES", 8))
     frame_extract_timeout: int = _int_env("DEEP_SCAN_FRAME_TIMEOUT", 180)
     inference_timeout: float = _float_env("DEEP_SCAN_INFER_TIMEOUT", _float_env("INFER_REQUEST_TIMEOUT", 20.0))
     model_version: str = os.getenv("DEEP_SCAN_MODEL_VERSION", "deep_v1")
     log_level: str = os.getenv("DEEP_SCAN_LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")).upper()
+    storage_dir: str = os.getenv(
+        "DEEP_SCAN_STORAGE_DIR",
+        str((Path(__file__).parent.parent / "out" / "deep_scans").resolve()),
+    )
 
 
 settings = Settings()

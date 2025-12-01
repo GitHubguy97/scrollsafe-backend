@@ -551,3 +551,15 @@ async def lifespan(app: FastAPI):
             db_pool.close()
 
 
+if __name__ == "__main__":
+    import uvicorn
+
+    max_bytes = int(os.getenv("MAX_REQUEST_BYTES", str(64 * 1024 * 1024)))
+    uvicorn.run(
+        "main:app",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8000")),
+        limit_max_request_size=max_bytes,
+    )
+
+

@@ -830,11 +830,11 @@ def _decide_label(scores_list: List[Dict[str, float]], heuristics_result: Option
 
     # Rule 2: Very strong artificial signal (RAISED thresholds - more conservative)
     if has_ai_keywords:
-        # With AI keywords in title/description, use moderate threshold
+        # With AI keywords, still require strong visual signals
         if (
-            frac_a95 >= 0.35  # 35%+ frames at 0.95+
-            or (count_a90 >= 4 and top3_mean >= 0.94)  # 4+ frames at 0.90+, top3 avg 0.94+
-            or frac_a90 >= 0.5  # 50%+ frames at 0.90+
+            frac_a95 >= 0.40  # 40%+ frames at 0.95+
+            or (count_a90 >= 5 and top3_mean >= 0.95)  # 5+ frames at 0.90+, top3 avg 0.95+
+            or frac_a90 >= 0.60  # 60%+ frames at 0.90+
         ):
             return {
                 "label": "artificial",
@@ -861,11 +861,11 @@ def _decide_label(scores_list: List[Dict[str, float]], heuristics_result: Option
 
     # Rule 3: Suspicious signals
     if has_ai_keywords:
-        # With AI keywords, be more suspicious with moderate signals
+        # With AI keywords, still require more than a single spike
         if (
-            count_a90 >= 1  # Any frame at 0.90+
-            or frac_a80 >= 0.20  # 20%+ frames at 0.80
-            or max_artificial >= 0.85  # Any single frame >= 0.85
+            count_a90 >= 2  # At least two strong frames
+            or frac_a80 >= 0.30  # 30%+ frames at 0.80
+            or (max_artificial >= 0.90 and frac_a80 >= 0.15)
         ):
             return {
                 "label": "suspicious",
@@ -876,9 +876,9 @@ def _decide_label(scores_list: List[Dict[str, float]], heuristics_result: Option
     else:
         # Without AI keywords, need stronger signal for suspicious
         if (
-            (3 <= count_a90 <= 5 and top3_mean >= 0.93)  # 3-5 frames at 0.90+, top3 avg 0.93+
-            or (0.30 <= frac_a90 <= 0.60 and max_artificial >= 0.92)  # 30-60% at 0.90+, max 0.92+
-            or (frac_a80 >= 0.40 and top3_mean >= 0.90)  # 40%+ at 0.80, top3 avg 0.90+
+            (4 <= count_a90 <= 6 and top3_mean >= 0.93)  # 4-6 frames at 0.90+, top3 avg 0.93+
+            or (0.35 <= frac_a90 <= 0.60 and max_artificial >= 0.93)
+            or (frac_a80 >= 0.45 and top3_mean >= 0.90)
         ):
             return {
                 "label": "suspicious",

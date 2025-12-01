@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 from yt_dlp import YoutubeDL
+import shutil
 
 
 load_dotenv()
@@ -87,6 +88,15 @@ def _load_saved_frames(frame_dir: str) -> List[bytes]:
         raise RuntimeError(f"No frames found in {frame_dir}")
 
     return [file.read_bytes() for file in frame_files]
+
+
+def _cleanup_frame_dir(frame_dir: Optional[str]) -> None:
+    if not frame_dir:
+        return
+    try:
+        shutil.rmtree(frame_dir, ignore_errors=True)
+    except Exception:
+        logger.warning("Failed to remove frame directory %s", frame_dir, exc_info=True)
 
 
 # ==============================================================================
@@ -956,6 +966,7 @@ def process_deep_scan_job(job_id: str, payload: Dict[str, Any]) -> None:
     video_id = payload.get("video_id")
     url = payload.get("url")
     client_hints = payload.get("client_hints")
+    frame_dir = payload.get("frame_dir")
 
     if not video_id or not url:
         _store_job_status(job_id, "failed", error="Missing video_id or url")
@@ -984,7 +995,6 @@ def process_deep_scan_job(job_id: str, payload: Dict[str, Any]) -> None:
 
         heuristics_result = check_heuristics(heuristics_source) if heuristics_source else None
 
-        frame_dir = payload.get("frame_dir")
         if not frame_dir:
             raise RuntimeError("Frame directory not provided in job payload")
 
@@ -1036,4 +1046,5 @@ def process_deep_scan_job(job_id: str, payload: Dict[str, Any]) -> None:
         _store_job_status(job_id, "failed", error=str(exc))
         raise
     finally:
+        _cleanup_frame_dir(frame_dir)
         client.delete(lock_key)

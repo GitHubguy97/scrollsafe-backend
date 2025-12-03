@@ -559,7 +559,7 @@ if __name__ == "__main__":
         "main:app",
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
-        limit_max_request_size=max_bytes,
+        h11_max_incomplete_event_size=max_bytes,
     )
 
 

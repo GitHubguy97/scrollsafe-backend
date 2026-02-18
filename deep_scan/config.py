@@ -57,6 +57,10 @@ class Settings:
         "DEEP_SCAN_STORAGE_DIR",
         str((Path(__file__).parent.parent / "out" / "deep_scans").resolve()),
     )
+    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+    gemini_model: str = os.getenv("DEEP_SCAN_GEMINI_MODEL", "gemini-3-flash-preview")
+    gemini_api_version: str = os.getenv("DEEP_SCAN_GEMINI_API_VERSION", "v1alpha")
+    gemini_timeout: float = _float_env("DEEP_SCAN_GEMINI_TIMEOUT", 60.0)
 
 
 settings = Settings()

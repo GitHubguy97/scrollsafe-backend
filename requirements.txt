@@ -50,3 +50,4 @@ websockets==15.0.1
 celery==5.3.4
 redis==5.0.1
 yt-dlp==2024.10.7
+google-genai==1.60.0

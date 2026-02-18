@@ -18,6 +18,6 @@ celery_app.conf.update(
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],
-    include=["deep_scan.tasks"],
+    include=["deep_scan.tasks", "deep_scan.task_deprecated"],
     timezone="UTC",
 )

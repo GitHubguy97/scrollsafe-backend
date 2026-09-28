@@ -132,7 +132,7 @@ SSH         TCP       22          <Your-IP>/32        Admin access
 
 ### Database Password
 
-Redis and PostgreSQL both use password: `postgres1997!`
+Redis and PostgreSQL both use password: `<password>`
 
 To change:
 1. Update `docker-compose.yaml`:
